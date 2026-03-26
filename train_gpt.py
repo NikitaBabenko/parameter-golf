@@ -56,6 +56,11 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    
+    # Sliding Window Evaluation
+    use_sliding_window = int(os.environ.get("USE_SLIDING_WINDOW", "0"))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", train_seq_len // 2 if use_sliding_window else train_seq_len))
+    
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -234,6 +239,7 @@ def eval_val(
     base_bytes_lut: Tensor,
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
+    t0_global: float = None,  # Pass global start time to monitor wallclock
 ) -> tuple[float, float]:
     # Validation computes two metrics:
     # - val_loss: token cross-entropy (natural log)
@@ -245,30 +251,96 @@ def eval_val(
             f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
             f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
         )
-    local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
-    seq_start = (total_seqs * rank) // world_size
-    seq_end = (total_seqs * (rank + 1)) // world_size
+    
+    stride = args.eval_stride
+    seq_len = args.train_seq_len
+    
+    if stride <= 0 or stride > seq_len:
+        stride = seq_len
+
+    # If SWE is used, the first stride in a sequence doesn't have warm context.
+    # To keep it simple and match standard behavior when stride=seq_len, 
+    # we just step by `stride`.
+    total_tokens = val_tokens.numel() - 1
+    
+    # Calculate how many evaluation steps we can fit.
+    # If stride < seq_len, we need to start at index 0 and slide by stride.
+    # The last window must end at or before total_tokens.
+    if total_tokens < seq_len:
+        raise ValueError(f"Validation split is too short for TRAIN_SEQ_LEN={seq_len}")
+        
+    num_windows = (total_tokens - seq_len) // stride + 1
+    
+    # Distribute windows across ranks
+    windows_per_rank = num_windows // world_size
+    start_window_idx = rank * windows_per_rank
+    end_window_idx = start_window_idx + windows_per_rank
+    if rank == world_size - 1:
+        # Give the last rank any remaining windows
+        end_window_idx = num_windows
+
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
+    # How many windows to process in a single batched forward pass
+    windows_per_batch = max(1, local_batch_tokens // seq_len)
+
     model.eval()
     with torch.inference_mode():
-        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
-            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            raw_start = batch_seq_start * args.train_seq_len
-            raw_end = batch_seq_end * args.train_seq_len + 1
-            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
+        for batch_start_idx in range(start_window_idx, end_window_idx, windows_per_batch):
+            # Time check to abort SWE if we're running out of time (only if wallclock is set)
+            if t0_global is not None and args.max_wallclock_seconds > 0:
+                elapsed_global = time.perf_counter() - t0_global
+                remaining = args.max_wallclock_seconds - elapsed_global
+                if remaining < 30.0:
+                    print(f"Rank {rank}: Aborting eval_val early to save model. Remaining time: {remaining:.1f}s")
+                    break
+
+            batch_end_idx = min(batch_start_idx + windows_per_batch, end_window_idx)
+            current_batch_size = batch_end_idx - batch_start_idx
+            
+            # Construct the batch of overlapping sequences
+            X_batch = torch.empty((current_batch_size, seq_len), dtype=torch.int64, device=device)
+            Y_batch = torch.empty((current_batch_size, seq_len), dtype=torch.int64, device=device)
+            
+            for i, window_idx in enumerate(range(batch_start_idx, batch_end_idx)):
+                token_start = window_idx * stride
+                token_end = token_start + seq_len
+                # Grab seq_len + 1 tokens to form x and y
+                local_tokens = val_tokens[token_start : token_end + 1].to(device, non_blocking=True)
+                X_batch[i] = local_tokens[:-1]
+                Y_batch[i] = local_tokens[1:]
+
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
-            batch_token_count = float(y.numel())
+                # logits: [B, T, V] or loss: [1]
+                # Since model(x, y) returns scalar loss averaged over B*T, we can't easily isolate the trailing stride tokens if we just call model(x,y).
+                # We need the model to return logits so we can slice the last `stride` tokens.
+                logits = model(X_batch) # [B, T, V]
+                
+            # Only score the last `stride` tokens (the "warm" context)
+            # Exception: if this is the very first window in the dataset (window_idx == 0), 
+            # we should technically score all tokens. For simplicity and consistency with SWE, 
+            # we'll just score the last `stride` tokens for all windows, or all tokens if stride == seq_len.
+            
+            if stride == seq_len:
+                score_logits = logits
+                score_targets = Y_batch
+            else:
+                score_logits = logits[:, -stride:, :]
+                score_targets = Y_batch[:, -stride:]
+
+            # Calculate loss
+            batch_loss = F.cross_entropy(score_logits.reshape(-1, args.vocab_size), score_targets.reshape(-1))
+            
+            batch_token_count = float(score_targets.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
-            prev_ids = x.reshape(-1)
-            tgt_ids = y.reshape(-1)
+            
+            # Calculate bytes
+            prev_ids = X_batch[:, -stride:].reshape(-1) if stride != seq_len else X_batch.reshape(-1)
+            tgt_ids = score_targets.reshape(-1)
+            
             token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
             token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
             val_byte_count += token_bytes.to(torch.float64).sum()
@@ -278,9 +350,9 @@ def eval_val(
         dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
         dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
 
-    val_loss = val_loss_sum / val_token_count
-    bits_per_token = val_loss.item() / math.log(2.0)
-    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    val_loss = (val_loss_sum / val_token_count) if val_token_count > 0 else torch.tensor(0.0)
+    bits_per_token = val_loss.item() / math.log(2.0) if val_token_count > 0 else 0.0
+    tokens_per_byte = val_token_count.item() / val_byte_count.item() if val_byte_count > 0 else 0.0
     model.train()
     return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
@@ -1088,6 +1160,7 @@ def main() -> None:
                 base_bytes_lut,
                 has_leading_space_lut,
                 is_boundary_token_lut,
+                t0_global=t0, # pass start time
             )
             log0(
                 f"step:{step}/{args.iterations} val_loss:{val_loss:.4f} val_bpb:{val_bpb:.4f} "
