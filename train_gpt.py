@@ -549,13 +549,16 @@ class CausalFNetBlock(nn.Module):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
         
-        # Экономим память: только 2 проекции (signal и gate) вместо 3 (Q, K, V)
+        # ДОБАВЛЯЕМ ГОЛОВЫ
+        self.num_heads = 8
+        self.head_dim = d_model // 8
+        
         self.in_proj = QATLinear(d_model, 2 * d_model, bias=False)
         self.o_proj = QATLinear(d_model, d_model, bias=False)
         
-        # ZERO-PARAMETER MIXER (Фиксированный фильтр "эха")
-        # Стартуем с идеального каузального эха, но разрешаем модели его менять
-        decay = torch.exp(-0.1 * torch.arange(seq_len)).unsqueeze(1) # [seq_len, 1]
+        # MULTI-HEAD MIXER: Фильтр теперь [seq_len, num_heads]
+        # Каждая из 8 голов стартует с одинакового затухания, но обучается независимо
+        decay = torch.exp(-0.1 * torch.arange(seq_len)).unsqueeze(1).repeat(1, self.num_heads)
         self.fixed_filter = nn.Parameter(decay)
         
         self.norm2 = RMSNorm(d_model)
@@ -563,7 +566,6 @@ class CausalFNetBlock(nn.Module):
         self.mlp_out = QATLinear(int(mlp_mult * d_model), d_model, bias=False)
         
     def forward(self, x):
-        # --- БЛОК FNET ---
         residual = x
         x = self.norm1(x)
         B, T, C = x.shape
@@ -571,25 +573,31 @@ class CausalFNetBlock(nn.Module):
         qkv = self.in_proj(x)
         signal, gate = qkv.split(C, dim=2)
         
-        # ВАЖНО: FFT работает только в float32, иначе словим NaN!
-        signal_f32 = signal.float()
-        h_f32 = self.fixed_filter[:T, :].float().unsqueeze(0) # [1, T, 1]
+        # --- MULTI-HEAD МАГИЯ ---
+        # signal: [B, T, H, D] -> [B, H, T, D]
+        signal_f32 = signal.view(B, T, self.num_heads, self.head_dim).transpose(1, 2).float()
         
-        # ПАДДИНГ НУЛЯМИ: Защита от заглядывания в будущее (T -> 2T)
+        # filter: [T, H] -> [H, T] -> [1, H, T, 1] (для броадкаста)
+        h_f32 = self.fixed_filter[:T, :].transpose(0, 1).view(1, self.num_heads, T, 1).float()
+        
+        # Паддинг оси T (теперь она вторая с конца)
+        # F.pad работает с конца: (pad_D_left, pad_D_right, pad_T_left, pad_T_right)
         signal_padded = F.pad(signal_f32, (0, 0, 0, T))
         h_padded = F.pad(h_f32, (0, 0, 0, T))
         
-        # Быстрое преобразование Фурье
-        S_fft = torch.fft.rfft(signal_padded, dim=1)
-        H_fft = torch.fft.rfft(h_padded, dim=1)
+        # Быстрое преобразование Фурье по оси T (dim=2)
+        S_fft = torch.fft.rfft(signal_padded, dim=2)
+        H_fft = torch.fft.rfft(h_padded, dim=2)
         
-        # Перемножение спектров (эквивалент каузальной свёртки)
         Y_fft = S_fft * H_fft
         
-        # Обратное FFT и отрезание паддинга (берем только первые T шагов)
-        y_causal = torch.fft.irfft(Y_fft, n=2*T, dim=1)[:, :T, :]
+        # Обратное FFT и обрезка будущего
+        y_causal = torch.fft.irfft(Y_fft, n=2*T, dim=2)[:, :, :T, :]
         
-        # Каст обратно в bfloat16, умножение на ворота
+        # Возвращаем размерность: [B, H, T, D] -> [B, T, H, D] -> [B, T, C]
+        y_causal = y_causal.transpose(1, 2).reshape(B, T, C)
+        # ------------------------
+        
         out = y_causal.type_as(x) * F.silu(gate)
         x = residual + self.o_proj(out)
         
@@ -821,7 +829,7 @@ def main() -> None:
     base_model = HybridHyenaGolfModel(
         vocab_size=args.vocab_size,
         d_model=args.model_dim,
-        num_hyena=7,
+        num_hyena=6,
         num_attn=1,
         mlp_mult=args.mlp_mult
     ).to(device).bfloat16()
