@@ -519,7 +519,13 @@ class RMSNorm(nn.Module):
         return output * self.weight
 
 def fake_quantize_int8(w: torch.Tensor) -> torch.Tensor:
-    scale = w.abs().max() / 127.0
+    if w.ndim == 2:
+        # Скейл по каждой строке для 2D матриц (как при экспорте)
+        scale = w.abs().max(dim=1, keepdim=True)[0] / 127.0
+    else:
+        # Глобальный скейл для 1D векторов
+        scale = w.abs().max() / 127.0
+        
     scale = scale.clamp(min=1e-8)
     w_q = torch.round(w / scale) * scale
     return w + (w_q - w).detach()
@@ -577,7 +583,7 @@ class QATTransformerBlock(nn.Module):
         return residual + x
 
 class PureQATGolfModel(nn.Module):
-    def __init__(self, vocab_size, d_model, num_layers=6, mlp_mult=2.0):
+    def __init__(self, vocab_size, d_model, num_layers=7, mlp_mult=2.0):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -710,7 +716,7 @@ def main() -> None:
     base_model = PureQATGolfModel(
         vocab_size=args.vocab_size,
         d_model=args.model_dim,
-        num_layers=6,  # Force 6 layers to fit in 16MB int8
+        num_layers=7,
         mlp_mult=args.mlp_mult
     ).to(device).bfloat16()
     restore_low_dim_params_to_fp32(base_model)
