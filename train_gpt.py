@@ -600,16 +600,59 @@ class CausalFNetBlock(nn.Module):
         x = self.mlp_out(x)
         return residual + x
 
-class PureQATGolfModel(nn.Module):
-    def __init__(self, vocab_size, d_model, num_layers=7, mlp_mult=2.0):
+class QATTransformerBlock(nn.Module):
+    def __init__(self, d_model, mlp_mult=2.0):
+        super().__init__()
+        self.norm1 = RMSNorm(d_model)
+        
+        self.num_heads = 8
+        self.head_dim = d_model // 8
+        self.qkv_proj = QATLinear(d_model, 3 * d_model, bias=False)
+        self.o_proj = QATLinear(d_model, d_model, bias=False)
+        
+        self.norm2 = RMSNorm(d_model)
+        hidden_dim = int(mlp_mult * d_model)
+        self.mlp_in = QATLinear(d_model, hidden_dim, bias=False)
+        self.mlp_out = QATLinear(hidden_dim, d_model, bias=False)
+        
+    def forward(self, x):
+        # Attention
+        residual = x
+        x = self.norm1(x)
+        B, T, C = x.shape
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split(C, dim=2)
+        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        x = residual + self.o_proj(y)
+        
+        # MLP
+        residual = x
+        x = self.norm2(x)
+        x = self.mlp_in(x)
+        x = F.gelu(x)
+        x = self.mlp_out(x)
+        return residual + x
+
+class HybridHyenaGolfModel(nn.Module):
+    def __init__(self, vocab_size, d_model, num_hyena=7, num_attn=1, mlp_mult=2.0):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         
         self.embedding = nn.Embedding(vocab_size, d_model)
-        self.blocks = nn.ModuleList([CausalFNetBlock(d_model, mlp_mult) for _ in range(num_layers)])
-        self.final_norm = RMSNorm(d_model)
         
+        # 7 слоев спектрального пылесоса
+        self.hyena_blocks = nn.ModuleList([CausalFNetBlock(d_model, mlp_mult) for _ in range(num_hyena)])
+        
+        # 1 слой снайперского Внимания в самом конце
+        self.attn_blocks = nn.ModuleList([QATTransformerBlock(d_model, mlp_mult) for _ in range(num_attn)])
+        
+        self.final_norm = RMSNorm(d_model)
         self.head = QATLinear(d_model, vocab_size, bias=False)
         self.head.weight = self.embedding.weight
         
@@ -618,7 +661,12 @@ class PureQATGolfModel(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor = None) -> Tensor:
         x = self.embedding(input_ids)
         
-        for layer in self.blocks:
+        # Сначала прогоняем через быстрое Фурье-эхо
+        for layer in self.hyena_blocks:
+            x = layer(x)
+            
+        # В конце подытоживаем Трансформером
+        for layer in self.attn_blocks:
             x = layer(x)
             
         x = self.final_norm(x)
@@ -731,10 +779,11 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
-    base_model = PureQATGolfModel(
+    base_model = HybridHyenaGolfModel(
         vocab_size=args.vocab_size,
         d_model=args.model_dim,
-        num_layers=7,
+        num_hyena=7,
+        num_attn=1,
         mlp_mult=args.mlp_mult
     ).to(device).bfloat16()
     restore_low_dim_params_to_fp32(base_model)
