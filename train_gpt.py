@@ -518,69 +518,10 @@ class RMSNorm(nn.Module):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
-try:
-    import triton
-    import triton.language as tl
-    
-    @triton.jit
-    def _fake_quantize_int8_kernel(
-        W_ptr, Out_ptr,
-        n_rows, n_cols,
-        BLOCK_SIZE: tl.constexpr
-    ):
-        pid = tl.program_id(axis=0)
-        row_start = pid * n_cols
-        offsets = tl.arange(0, BLOCK_SIZE)
-        
-        # Загружаем строку
-        mask = offsets < n_cols
-        w = tl.load(W_ptr + row_start + offsets, mask=mask, other=0.0)
-        
-        # Находим максимальное по модулю значение в строке
-        w_abs = tl.math.abs(w)
-        row_max = tl.max(w_abs, axis=0)
-        
-        # Вычисляем скейл и защищаем от деления на ноль
-        scale = row_max / 127.0
-        scale = tl.where(scale < 1e-8, 1e-8, scale)
-        
-        # Квантуем и деквантуем
-        w_q = tl.math.round(w / scale) * scale
-        
-        # Сохраняем результат
-        tl.store(Out_ptr + row_start + offsets, w_q, mask=mask)
-
-    def fake_quantize_int8_triton(w: torch.Tensor) -> torch.Tensor:
-        if w.ndim != 2:
-            # Для 1D векторов оставляем старый код, их слишком мало
-            scale = w.abs().max() / 127.0
-            scale = scale.clamp(min=1e-8)
-            w_q = torch.round(w / scale) * scale
-            return w + (w_q - w).detach()
-            
-        n_rows, n_cols = w.shape
-        out = torch.empty_like(w)
-        
-        # Округляем до ближайшей степени двойки для блока
-        BLOCK_SIZE = triton.next_power_of_2(n_cols)
-        
-        # 1 поток = 1 строка матрицы
-        _fake_quantize_int8_kernel[(n_rows,)](
-            w, out,
-            n_rows, n_cols,
-            BLOCK_SIZE=BLOCK_SIZE
-        )
-        # STE для проброса градиента
-        return w + (out - w).detach()
-        
-    HAS_TRITON = True
-except ImportError:
-    HAS_TRITON = False
-
 def fake_quantize_int8(w: torch.Tensor) -> torch.Tensor:
-    if HAS_TRITON and w.is_cuda and w.ndim == 2:
-        return fake_quantize_int8_triton(w)
-        
+    if os.environ.get("USE_QAT", "1") == "0":
+        return w
+
     if w.ndim == 2:
         # Скейл по каждой строке для 2D матриц (как при экспорте)
         scale = w.abs().max(dim=1, keepdim=True)[0] / 127.0
@@ -601,11 +542,8 @@ class QATLinear(nn.Module):
         else:
             self.register_parameter('bias', None)
         nn.init.normal_(self.weight, std=0.02)
-        
-        # Компилируем сам форвард для снижения оверхеда
-        self.forward = torch.compile(self._forward, mode="reduce-overhead") if hasattr(torch, "compile") else self._forward
 
-    def _forward(self, x):
+    def forward(self, x):
         w_q = fake_quantize_int8(self.weight)
         return F.linear(x, w_q, self.bias)
 
