@@ -689,7 +689,7 @@ class VanillaTransformerBlock(nn.Module):
         return residual + x
 
 class HybridHyenaGolfModel(nn.Module):
-    def __init__(self, vocab_size, d_model, num_hyena=6, num_attn=1, mlp_mult=2.0):
+    def __init__(self, vocab_size, d_model, num_hyena=7, num_attn=1, mlp_mult=2.0):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -899,8 +899,8 @@ def main() -> None:
     base_model = HybridHyenaGolfModel(
         vocab_size=args.vocab_size,
         d_model=args.model_dim,
-        num_hyena=10,
-        num_attn=2,
+        num_hyena=7,
+        num_attn=1,
         mlp_mult=args.mlp_mult
     ).to(device).bfloat16()
     restore_low_dim_params_to_fp32(base_model)
