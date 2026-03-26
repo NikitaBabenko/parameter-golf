@@ -688,82 +688,96 @@ class VanillaTransformerBlock(nn.Module):
         x = self.mlp_out(x)
         return residual + x
 
-class HybridHyenaGolfModel(nn.Module):
-    def __init__(self, vocab_size, d_model, num_hyena=7, num_attn=1, mlp_mult=2.0):
-        super().__init__()
-        self.vocab_size = vocab_size
-        self.d_model = d_model
-        
-        self.embedding = nn.Embedding(vocab_size, d_model)
-        
-        # 6 слоев спектрального пылесоса
-        self.hyena_blocks = nn.ModuleList([CausalFNetBlock(d_model, mlp_mult) for _ in range(num_hyena)])
-        
-        # 1 слой снайперского Внимания в самом конце (БЕЗ QAT, чистый FP16)
-        self.attn_blocks = nn.ModuleList([VanillaTransformerBlock(d_model, mlp_mult) for _ in range(num_attn)])
-        
-        self.final_norm = RMSNorm(d_model)
-        self.head = QATLinear(d_model, vocab_size, bias=False)
-        self.head.weight = self.embedding.weight
-        
-        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.005)
-
-    def forward(self, input_ids: Tensor, target_ids: Tensor = None) -> Tensor:
-        x = self.embedding(input_ids)
-        
-        # Сначала прогоняем через быстрое Фурье-эхо
-        for layer in self.hyena_blocks:
-            x = layer(x)
-            
-        # В конце подытоживаем Трансформером
-        for layer in self.attn_blocks:
-            x = layer(x)
-            
-        x = self.final_norm(x)
-        logits = self.head(x)
-        
-        if target_ids is not None:
-            return F.cross_entropy(logits.view(-1, self.vocab_size), target_ids.view(-1), reduction="mean")
-        return logits
-
 class BigramHash(nn.Module):
-    def __init__(self, d_model, hash_size=10240, emb_dim=64):
+    def __init__(self, d_model, hash_size=20480, emb_dim=64):
         super().__init__()
         self.hash_size = hash_size
         self.bigram_emb = nn.Embedding(hash_size, emb_dim)
         self.proj = nn.Linear(emb_dim, d_model, bias=False)
-        self.p1 = 31337 # Простенькое прайм-число для хеширования
+        self.p1 = 31337
 
     def forward(self, input_ids):
-        # input_ids: [B, T]
         B, T = input_ids.shape
-        
-        # Сдвигаем токены вправо, чтобы получить предыдущий токен
-        # Для первого токена используем 0
         shifted_ids = F.pad(input_ids[:, :-1], (1, 0), value=0)
-        
-        # Вычисляем хеш: (input_ids_{i-1} * P1 XOR input_ids_i) % 10240
         h = ((shifted_ids * self.p1) ^ input_ids) % self.hash_size
+        emb = self.bigram_emb(h)
+        return self.proj(emb)
+
+class TrigramHash(nn.Module):
+    def __init__(self, d_model, hash_size=10240, emb_dim=64):
+        super().__init__()
+        self.hash_size = hash_size
+        self.trigram_emb = nn.Embedding(hash_size, emb_dim)
+        self.proj = nn.Linear(emb_dim, d_model, bias=False)
+        self.p1 = 31337
+        self.p2 = 179424673
+
+    def forward(self, input_ids):
+        B, T = input_ids.shape
+        t_i = input_ids
+        t_minus_1 = F.pad(input_ids[:, :-1], (1, 0), value=0)
+        t_minus_2 = F.pad(input_ids[:, :-2], (2, 0), value=0)
         
-        # Lookup и проекция
-        emb = self.bigram_emb(h) # [B, T, 64]
-        return self.proj(emb)    # [B, T, d_model]
+        h = ((t_minus_2 * self.p1) ^ (t_minus_1 * self.p2) ^ t_i) % self.hash_size
+        emb = self.trigram_emb(h)
+        return self.proj(emb)
+
+class BigramHash(nn.Module):
+    def __init__(self, d_model, hash_size=20480, emb_dim=64):
+        super().__init__()
+        self.hash_size = hash_size
+        self.bigram_emb = nn.Embedding(hash_size, emb_dim)
+        self.proj = nn.Linear(emb_dim, d_model, bias=False)
+        self.p1 = 31337
+        
+        # Orthogonal Initialization
+        nn.init.orthogonal_(self.proj.weight)
+
+    def forward(self, input_ids):
+        B, T = input_ids.shape
+        shifted_ids = F.pad(input_ids[:, :-1], (1, 0), value=0)
+        h = ((shifted_ids * self.p1) ^ input_ids) % self.hash_size
+        emb = self.bigram_emb(h)
+        return self.proj(emb)
+
+class TrigramHash(nn.Module):
+    def __init__(self, d_model, hash_size=10240, emb_dim=64):
+        super().__init__()
+        self.hash_size = hash_size
+        self.trigram_emb = nn.Embedding(hash_size, emb_dim)
+        self.proj = nn.Linear(emb_dim, d_model, bias=False)
+        self.p1 = 31337
+        self.p2 = 179424673
+        
+        # Orthogonal Initialization
+        nn.init.orthogonal_(self.proj.weight)
+
+    def forward(self, input_ids):
+        B, T = input_ids.shape
+        t_i = input_ids
+        t_minus_1 = F.pad(input_ids[:, :-1], (1, 0), value=0)
+        t_minus_2 = F.pad(input_ids[:, :-2], (2, 0), value=0)
+        
+        h = ((t_minus_2 * self.p1) ^ (t_minus_1 * self.p2) ^ t_i) % self.hash_size
+        emb = self.trigram_emb(h)
+        return self.proj(emb)
 
 class HybridHyenaGolfModel(nn.Module):
-    def __init__(self, vocab_size, d_model, num_hyena=7, num_attn=1, mlp_mult=2.0):
+    def __init__(self, vocab_size, d_model, num_hyena=7, num_attn=1, mlp_mult=4.0):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         
         self.embedding = nn.Embedding(vocab_size, d_model)
         
-        # 7 слоев спектрального пылесоса
+        # Слои спектрального пылесоса (без промежуточного QAT)
         self.hyena_blocks = nn.ModuleList([CausalFNetBlock(d_model, mlp_mult) for _ in range(num_hyena)])
         
-        # BigramHash Layer
+        # Система хеширования (Knowledge Injection)
         self.bigram_hash = BigramHash(d_model)
+        self.trigram_hash = TrigramHash(d_model)
         
-        # 1 слой снайперского Внимания в самом конце
+        # Слой снайперского Внимания в самом конце
         self.attn_blocks = nn.ModuleList([VanillaTransformerBlock(d_model, mlp_mult) for _ in range(num_attn)])
         
         self.final_norm = RMSNorm(d_model)
@@ -772,6 +786,11 @@ class HybridHyenaGolfModel(nn.Module):
         
         nn.init.normal_(self.embedding.weight, mean=0.0, std=0.005)
 
+        # Применяем Orthogonal Initialization ко всем Linear слоям (кроме хешей, там уже сделано)
+        for name, module in self.named_modules():
+            if isinstance(module, nn.Linear) and 'proj' in name or 'mlp' in name:
+                nn.init.orthogonal_(module.weight)
+
     def forward(self, input_ids: Tensor, target_ids: Tensor = None) -> Tensor:
         x = self.embedding(input_ids)
         
@@ -779,8 +798,8 @@ class HybridHyenaGolfModel(nn.Module):
         for layer in self.hyena_blocks:
             x = layer(x)
             
-        # Добавляем фичу BigramHash (Residual connection)
-        x = x + self.bigram_hash(input_ids)
+        # Внедрение знания (Knowledge Injection)
+        x = x + self.bigram_hash(input_ids) + self.trigram_hash(input_ids)
             
         # В конце подытоживаем Трансформером
         for layer in self.attn_blocks:
@@ -1213,4 +1232,9 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
 
