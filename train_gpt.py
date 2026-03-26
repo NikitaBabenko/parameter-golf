@@ -544,37 +544,56 @@ class QATLinear(nn.Module):
         w_q = fake_quantize_int8(self.weight)
         return F.linear(x, w_q, self.bias)
 
-class QATTransformerBlock(nn.Module):
-    def __init__(self, d_model, mlp_mult=2.0):
+class CausalFNetBlock(nn.Module):
+    def __init__(self, d_model, mlp_mult=2.0, seq_len=1024):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
         
-        self.num_heads = 8
-        self.head_dim = d_model // 8
-        self.qkv_proj = QATLinear(d_model, 3 * d_model, bias=False)
+        # Экономим память: только 2 проекции (signal и gate) вместо 3 (Q, K, V)
+        self.in_proj = QATLinear(d_model, 2 * d_model, bias=False)
         self.o_proj = QATLinear(d_model, d_model, bias=False)
         
+        # ZERO-PARAMETER MIXER (Фиксированный фильтр "эха")
+        # Экспоненциальное затухание в прошлое: 1.0, 0.9, 0.81...
+        decay = torch.exp(-0.1 * torch.arange(seq_len)).unsqueeze(1) # [seq_len, 1]
+        self.register_buffer("fixed_filter", decay)
+        
         self.norm2 = RMSNorm(d_model)
-        hidden_dim = int(mlp_mult * d_model)
-        self.mlp_in = QATLinear(d_model, hidden_dim, bias=False)
-        self.mlp_out = QATLinear(hidden_dim, d_model, bias=False)
+        self.mlp_in = QATLinear(d_model, int(mlp_mult * d_model), bias=False)
+        self.mlp_out = QATLinear(int(mlp_mult * d_model), d_model, bias=False)
         
     def forward(self, x):
-        # Attention
+        # --- БЛОК FNET ---
         residual = x
         x = self.norm1(x)
         B, T, C = x.shape
-        qkv = self.qkv_proj(x)
-        q, k, v = qkv.split(C, dim=2)
-        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
         
-        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
-        y = y.transpose(1, 2).contiguous().view(B, T, C)
-        x = residual + self.o_proj(y)
+        qkv = self.in_proj(x)
+        signal, gate = qkv.split(C, dim=2)
         
-        # MLP
+        # ВАЖНО: FFT работает только в float32, иначе словим NaN!
+        signal_f32 = signal.float()
+        h_f32 = self.fixed_filter[:T, :].float().unsqueeze(0) # [1, T, 1]
+        
+        # ПАДДИНГ НУЛЯМИ: Защита от заглядывания в будущее (T -> 2T)
+        signal_padded = F.pad(signal_f32, (0, 0, 0, T))
+        h_padded = F.pad(h_f32, (0, 0, 0, T))
+        
+        # Быстрое преобразование Фурье
+        S_fft = torch.fft.rfft(signal_padded, dim=1)
+        H_fft = torch.fft.rfft(h_padded, dim=1)
+        
+        # Перемножение спектров (эквивалент каузальной свёртки)
+        Y_fft = S_fft * H_fft
+        
+        # Обратное FFT и отрезание паддинга (берем только первые T шагов)
+        y_causal = torch.fft.irfft(Y_fft, n=2*T, dim=1)[:, :T, :]
+        
+        # Каст обратно в bfloat16, умножение на ворота
+        out = y_causal.type_as(x) * F.silu(gate)
+        x = residual + self.o_proj(out)
+        
+        # --- БЛОК MLP ---
         residual = x
         x = self.norm2(x)
         x = self.mlp_in(x)
@@ -589,7 +608,7 @@ class PureQATGolfModel(nn.Module):
         self.d_model = d_model
         
         self.embedding = nn.Embedding(vocab_size, d_model)
-        self.blocks = nn.ModuleList([QATTransformerBlock(d_model, mlp_mult) for _ in range(num_layers)])
+        self.blocks = nn.ModuleList([CausalFNetBlock(d_model, mlp_mult) for _ in range(num_layers)])
         self.final_norm = RMSNorm(d_model)
         
         self.head = QATLinear(d_model, vocab_size, bias=False)
