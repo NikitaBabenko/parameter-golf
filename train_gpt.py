@@ -650,6 +650,11 @@ class CausalFNetBlock(nn.Module):
         self.mlp_in = QATLinear(d_model, int(mlp_mult * d_model), bias=False)
         self.mlp_out = QATLinear(int(mlp_mult * d_model), d_model, bias=False)
         
+        self.use_smear_gate = bool(int(os.environ.get("USE_SMEAR_GATE", "0")))
+        if self.use_smear_gate:
+            # Обучаемый вектор размером с d_model
+            self.smear_gate = nn.Parameter(torch.ones(d_model))
+        
     def forward(self, x):
         residual = x
         x = self.norm1(x)
@@ -684,6 +689,12 @@ class CausalFNetBlock(nn.Module):
         # ------------------------
         
         out = y_causal.type_as(x) * F.silu(gate)
+        
+        # --- NEW: SmearGate ---
+        if getattr(self, "use_smear_gate", False):
+            out = out * self.smear_gate
+        # ----------------------
+        
         x = residual + self.o_proj(out)
         
         # --- БЛОК MLP ---
