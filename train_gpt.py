@@ -638,19 +638,57 @@ class QATTransformerBlock(nn.Module):
         x = self.mlp_out(x)
         return residual + x
 
+class VanillaTransformerBlock(nn.Module):
+    def __init__(self, d_model, mlp_mult=2.0):
+        super().__init__()
+        self.norm1 = RMSNorm(d_model)
+        
+        self.num_heads = 8
+        self.head_dim = d_model // 8
+        self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False)
+        self.o_proj = nn.Linear(d_model, d_model, bias=False)
+        
+        self.norm2 = RMSNorm(d_model)
+        hidden_dim = int(mlp_mult * d_model)
+        self.mlp_in = nn.Linear(d_model, hidden_dim, bias=False)
+        self.mlp_out = nn.Linear(hidden_dim, d_model, bias=False)
+        
+    def forward(self, x):
+        # Attention
+        residual = x
+        x = self.norm1(x)
+        B, T, C = x.shape
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split(C, dim=2)
+        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        x = residual + self.o_proj(y)
+        
+        # MLP
+        residual = x
+        x = self.norm2(x)
+        x = self.mlp_in(x)
+        x = F.gelu(x)
+        x = self.mlp_out(x)
+        return residual + x
+
 class HybridHyenaGolfModel(nn.Module):
-    def __init__(self, vocab_size, d_model, num_hyena=7, num_attn=1, mlp_mult=2.0):
+    def __init__(self, vocab_size, d_model, num_hyena=6, num_attn=1, mlp_mult=2.0):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
         
         self.embedding = nn.Embedding(vocab_size, d_model)
         
-        # 7 слоев спектрального пылесоса
+        # 6 слоев спектрального пылесоса
         self.hyena_blocks = nn.ModuleList([CausalFNetBlock(d_model, mlp_mult) for _ in range(num_hyena)])
         
-        # 1 слой снайперского Внимания в самом конце
-        self.attn_blocks = nn.ModuleList([QATTransformerBlock(d_model, mlp_mult) for _ in range(num_attn)])
+        # 1 слой снайперского Внимания в самом конце (БЕЗ QAT, чистый FP16)
+        self.attn_blocks = nn.ModuleList([VanillaTransformerBlock(d_model, mlp_mult) for _ in range(num_attn)])
         
         self.final_norm = RMSNorm(d_model)
         self.head = QATLinear(d_model, vocab_size, bias=False)
