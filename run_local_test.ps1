@@ -1,48 +1,49 @@
-$env:RUN_ID="fnet_hyena_stabilized_1000"
+$env:RUN_ID="local_test_gqa"
 $env:ITERATIONS=30
 $env:WARMUP_STEPS=5
-# Остывание на последних 200 шагах
 $env:WARMDOWN_ITERS=5
 
-# Снимаем ручник: агрессивные LR для большого батча
-$env:MATRIX_LR="0.0008"
-$env:SCALAR_LR="0.0008"
-$env:EMBED_LR="0.004"
+# LR (defaults are tuned for 8xH100 big batch, lower for local)
+$env:MATRIX_LR="0.04"
+$env:SCALAR_LR="0.04"
+$env:TIED_EMBED_LR="0.05"
+$env:GRAD_CLIP_NORM="0.3"
 
-# Зажимаем градиентные взрывы от Фурье
-$env:GRAD_CLIP_NORM="0.5"
+# Disable QAT and torch.compile for local (no Triton on Windows)
+$env:QAT_ENABLED="0"
+$env:USE_COMPILE="0"
 
-# Отключаем промежуточное QAT-квантование для скорости (0 - выкл, 1 - вкл)
-$env:USE_QAT="0"
+# Data paths (local data in parameter-golf_old)
+$env:DATA_PATH="../parameter-golf_old/data/datasets/fineweb10B_sp1024"
+$env:TOKENIZER_PATH="../parameter-golf_old/data/tokenizers/fineweb_1024_bpe.model"
 
-# Увеличиваем батч в 8 раз (65536 токенов)
+# Small batch for local GPU
 $env:TRAIN_BATCH_TOKENS=65536
-
-# Контекст оставляем большим
 $env:TRAIN_SEQ_LEN=1024
 
-# Защищаем Трансформер
-$env:INT8_KEEP_FLOAT_FP32_NAME_PATTERNS="attn_blocks"
-
-# Отключаем промежуточную валидацию для скорости
-$env:VAL_LOSS_EVERY=-1 
-# Безопасный размер батча для валидации в конце
+# Disable validation and eval
+$env:VAL_LOSS_EVERY=-1
 $env:VAL_BATCH_SIZE=8192
-$env:TRAIN_LOG_EVERY=10
-
-# Отключаем турнирный лимит времени для тестов по шагам
-$env:MAX_WALLCLOCK_SECONDS=0
-
-# Параметры архитектуры и тестов
-$env:NUM_HYENA=7
-$env:NUM_ATTN=1
-$env:USE_SMEAR_GATE="1"
+$env:TRAIN_LOG_EVERY=5
 $env:SKIP_EVAL="1"
 
-Write-Host "🚀 Запускаем План пробития 1.2 (Большой батч, умный старт, 1000 шагов)..."
-Write-Host "Логи пишутся в консоль и в logs/fnet_hyena_stabilized_1000.txt"
-Write-Host "ВНИМАНИЕ: Из-за большого батча шаги будут долгими, но Loss будет падать ИДЕАЛЬНО ровно."
-Write-Host "На шагах 800-1000 начнется 'остывание' для финального заныривания."
+# Disable time limit
+$env:MAX_WALLCLOCK_SECONDS=0
+
+# Architecture (use defaults mostly, but can override here)
+# $env:NUM_LAYERS=11
+# $env:MODEL_DIM=512
+# $env:NUM_HEADS=8
+# $env:NUM_KV_HEADS=4
+# $env:MLP_MULT="3.0"
+# $env:XSA_LAST_N=4
+# $env:BIGRAM_VOCAB_SIZE=4096
+# $env:BIGRAM_DIM=128
+
+# EMA off for local test speed
+$env:EMA_ENABLED="0"
+
+Write-Host "Local test: 30 steps, no eval, no QAT, no EMA"
 Write-Host "------------------------------------------------------------------"
 
 & "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" train_gpt.py
