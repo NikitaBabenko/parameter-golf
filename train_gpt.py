@@ -554,9 +554,8 @@ class CausalFNetBlock(nn.Module):
         self.o_proj = QATLinear(d_model, d_model, bias=False)
         
         # ZERO-PARAMETER MIXER (Фиксированный фильтр "эха")
-        # Экспоненциальное затухание в прошлое: 1.0, 0.9, 0.81...
-        decay = torch.exp(-0.1 * torch.arange(seq_len)).unsqueeze(1) # [seq_len, 1]
-        self.register_buffer("fixed_filter", decay)
+        # Обучаемый глобальный фильтр. Инициализируем небольшим шумом.
+        self.fixed_filter = nn.Parameter(torch.randn(seq_len, 1) * 0.02)
         
         self.norm2 = RMSNorm(d_model)
         self.mlp_in = QATLinear(d_model, int(mlp_mult * d_model), bias=False)
