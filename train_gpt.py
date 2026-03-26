@@ -65,7 +65,7 @@ class Hyperparameters:
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
-    mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_mult = float(os.environ.get("MLP_MULT", 2.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -600,15 +600,16 @@ class MambaBlock(nn.Module):
         return out + residual
 
 class TransformerBlock(nn.Module):
-    def __init__(self, d_model):
+    def __init__(self, d_model, mlp_mult=2.0):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, num_heads=8, batch_first=True)
         self.norm2 = RMSNorm(d_model)
+        hidden_dim = int(mlp_mult * d_model)
         self.mlp = nn.Sequential(
-            nn.Linear(d_model, 4 * d_model),
+            nn.Linear(d_model, hidden_dim),
             nn.GELU(),
-            nn.Linear(4 * d_model, d_model)
+            nn.Linear(hidden_dim, d_model)
         )
         
     def forward(self, x):
@@ -618,7 +619,7 @@ class TransformerBlock(nn.Module):
         return x
 
 class HybridGolfModel(nn.Module):
-    def __init__(self, vocab_size, d_model, num_unique_mambas=3, loops_per_mamba=1):
+    def __init__(self, vocab_size, d_model, mlp_mult=2.0, num_unique_mambas=3, loops_per_mamba=1):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -627,7 +628,7 @@ class HybridGolfModel(nn.Module):
         
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.mamba_layers = nn.ModuleList([MambaBlock(d_model) for _ in range(num_unique_mambas)])
-        self.transformer_layer = TransformerBlock(d_model)
+        self.transformer_layer = TransformerBlock(d_model, mlp_mult=mlp_mult)
         self.final_norm = RMSNorm(d_model)
         
         self.head = nn.Linear(d_model, vocab_size, bias=False)
@@ -958,8 +959,13 @@ def main() -> None:
         if should_log_train:
             step_time_s = (approx_training_time_ms - (training_time_ms if step == 1 else (approx_training_time_ms - 1000.0 * (time.perf_counter() - t0)))) / 1000.0
             tokens_per_sec = args.train_batch_tokens / max(step_time_s, 0.001) if step > 1 else 0
+            
+            # Approximate FineWeb SP1024 bytes per token for real-time BPB radar
+            EST_BYTES_PER_TOKEN = 3.75
+            est_bpb = train_loss.item() / (math.log(2.0) * EST_BYTES_PER_TOKEN)
+            
             log0(
-                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
+                f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} est_bpb:{est_bpb:.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms "
                 f"tok/s:{tokens_per_sec:.0f}"
             )
