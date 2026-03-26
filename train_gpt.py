@@ -829,6 +829,9 @@ class HybridHyenaGolfModel(nn.Module):
         
         self.embedding = nn.Embedding(vocab_size, d_model)
         
+        # Стартовый Трансформер
+        self.attn_blocks_start = nn.ModuleList([VanillaTransformerBlock(d_model, mlp_mult) for _ in range(num_attn)])
+        
         # Слои спектрального пылесоса (без промежуточного QAT)
         self.hyena_blocks = nn.ModuleList([CausalFNetBlock(d_model, mlp_mult) for _ in range(num_hyena)])
         
@@ -837,7 +840,7 @@ class HybridHyenaGolfModel(nn.Module):
         self.trigram_hash = TrigramHash(d_model)
         
         # Слой снайперского Внимания в самом конце
-        self.attn_blocks = nn.ModuleList([VanillaTransformerBlock(d_model, mlp_mult) for _ in range(num_attn)])
+        self.attn_blocks_end = nn.ModuleList([VanillaTransformerBlock(d_model, mlp_mult) for _ in range(num_attn)])
         
         self.final_norm = RMSNorm(d_model)
         self.head = nn.Linear(d_model, vocab_size, bias=False)
@@ -853,15 +856,19 @@ class HybridHyenaGolfModel(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor = None) -> Tensor:
         x = self.embedding(input_ids)
         
-        # Сначала прогоняем через быстрое Фурье-эхо
+        # 1. Стартовый Трансформер
+        for layer in self.attn_blocks_start:
+            x = layer(x)
+        
+        # 2. Магистраль Гиен
         for layer in self.hyena_blocks:
             x = layer(x)
             
         # Внедрение знания (Knowledge Injection)
         x = x + self.bigram_hash(input_ids) + self.trigram_hash(input_ids)
             
-        # В конце подытоживаем Трансформером
-        for layer in self.attn_blocks:
+        # 3. Финальный Трансформер
+        for layer in self.attn_blocks_end:
             x = layer(x)
             
         x = self.final_norm(x)
