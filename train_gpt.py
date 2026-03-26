@@ -71,12 +71,12 @@ class Hyperparameters:
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
-    embed_lr = float(os.environ.get("EMBED_LR", 0.005))
-    head_lr = float(os.environ.get("HEAD_LR", 0.005))
-    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.005))
+    embed_lr = float(os.environ.get("EMBED_LR", 0.002))
+    head_lr = float(os.environ.get("HEAD_LR", 0.002))
+    tied_embed_lr = float(os.environ.get("TIED_EMBED_LR", 0.002))
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
-    matrix_lr = float(os.environ.get("MATRIX_LR", 0.001))
-    scalar_lr = float(os.environ.get("SCALAR_LR", 0.001))
+    matrix_lr = float(os.environ.get("MATRIX_LR", 0.0005))
+    scalar_lr = float(os.environ.get("SCALAR_LR", 0.0005))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
