@@ -726,6 +726,73 @@ class HybridHyenaGolfModel(nn.Module):
             return F.cross_entropy(logits.view(-1, self.vocab_size), target_ids.view(-1), reduction="mean")
         return logits
 
+class BigramHash(nn.Module):
+    def __init__(self, d_model, hash_size=10240, emb_dim=64):
+        super().__init__()
+        self.hash_size = hash_size
+        self.bigram_emb = nn.Embedding(hash_size, emb_dim)
+        self.proj = nn.Linear(emb_dim, d_model, bias=False)
+        self.p1 = 31337 # Простенькое прайм-число для хеширования
+
+    def forward(self, input_ids):
+        # input_ids: [B, T]
+        B, T = input_ids.shape
+        
+        # Сдвигаем токены вправо, чтобы получить предыдущий токен
+        # Для первого токена используем 0
+        shifted_ids = F.pad(input_ids[:, :-1], (1, 0), value=0)
+        
+        # Вычисляем хеш: (input_ids_{i-1} * P1 XOR input_ids_i) % 10240
+        h = ((shifted_ids * self.p1) ^ input_ids) % self.hash_size
+        
+        # Lookup и проекция
+        emb = self.bigram_emb(h) # [B, T, 64]
+        return self.proj(emb)    # [B, T, d_model]
+
+class HybridHyenaGolfModel(nn.Module):
+    def __init__(self, vocab_size, d_model, num_hyena=7, num_attn=1, mlp_mult=2.0):
+        super().__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        
+        self.embedding = nn.Embedding(vocab_size, d_model)
+        
+        # 7 слоев спектрального пылесоса
+        self.hyena_blocks = nn.ModuleList([CausalFNetBlock(d_model, mlp_mult) for _ in range(num_hyena)])
+        
+        # BigramHash Layer
+        self.bigram_hash = BigramHash(d_model)
+        
+        # 1 слой снайперского Внимания в самом конце
+        self.attn_blocks = nn.ModuleList([VanillaTransformerBlock(d_model, mlp_mult) for _ in range(num_attn)])
+        
+        self.final_norm = RMSNorm(d_model)
+        self.head = nn.Linear(d_model, vocab_size, bias=False)
+        self.head.weight = self.embedding.weight
+        
+        nn.init.normal_(self.embedding.weight, mean=0.0, std=0.005)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor = None) -> Tensor:
+        x = self.embedding(input_ids)
+        
+        # Сначала прогоняем через быстрое Фурье-эхо
+        for layer in self.hyena_blocks:
+            x = layer(x)
+            
+        # Добавляем фичу BigramHash (Residual connection)
+        x = x + self.bigram_hash(input_ids)
+            
+        # В конце подытоживаем Трансформером
+        for layer in self.attn_blocks:
+            x = layer(x)
+            
+        x = self.final_norm(x)
+        logits = self.head(x)
+        
+        if target_ids is not None:
+            return F.cross_entropy(logits.view(-1, self.vocab_size), target_ids.view(-1), reduction="mean")
+        return logits
+
 def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
     pass # No-op for our simplified model for now
 
@@ -1146,3 +1213,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
