@@ -509,6 +509,19 @@ try:
 except ImportError:
     selective_scan_fn = None
 
+class RMSNorm(nn.Module):
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def _norm(self, x):
+        return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + self.eps)
+
+    def forward(self, x):
+        output = self._norm(x.float()).type_as(x)
+        return output * self.weight
+
 @torch.compiler.disable
 def slow_selective_scan(x, dt, A, B_ssm, C_ssm, D):
     batch, seq_len, d_inner = x.shape
@@ -534,14 +547,14 @@ def slow_selective_scan(x, dt, A, B_ssm, C_ssm, D):
     return y
 
 class MambaBlock(nn.Module):
-    def __init__(self, d_model, d_state=16, d_conv=4, expand=2):
+    def __init__(self, d_model, d_state=64, d_conv=4, expand=2):
         super().__init__()
         self.d_model = d_model
         self.d_inner = int(expand * d_model)
         self.d_state = d_state
         self.dt_rank = math.ceil(d_model / 16)
         
-        self.norm = nn.LayerNorm(d_model)
+        self.norm = RMSNorm(d_model)
         self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
         
         self.conv1d = nn.Conv1d(
@@ -579,27 +592,9 @@ class MambaBlock(nn.Module):
         x_dbl = self.x_proj(x)
         dt, B_ssm, C_ssm = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
         
-        if selective_scan_fn is not None:
-            # Fast CUDA implementation
-            A = -torch.exp(self.A_log.float())
-            y = selective_scan_fn(
-                x.transpose(1, 2), 
-                dt.transpose(1, 2), 
-                A, 
-                B_ssm.transpose(1, 2), 
-                C_ssm.transpose(1, 2), 
-                self.D.float(), 
-                z=None, 
-                delta_bias=self.dt_proj.bias.float(), 
-                delta_softplus=True, 
-                return_last_state=False
-            )
-            y = y.transpose(1, 2)
-        else:
-            # Fallback for local testing
-            dt = F.softplus(self.dt_proj(dt))
-            A = -torch.exp(self.A_log.float())
-            y = slow_selective_scan(x, dt, A, B_ssm, C_ssm, self.D)
+        dt = F.softplus(self.dt_proj(dt))
+        A = -torch.exp(self.A_log.float())
+        y = slow_selective_scan(x, dt, A, B_ssm, C_ssm, self.D)
             
         out = self.out_proj(y * F.silu(z))
         return out + residual
@@ -607,9 +602,9 @@ class MambaBlock(nn.Module):
 class TransformerBlock(nn.Module):
     def __init__(self, d_model):
         super().__init__()
-        self.norm1 = nn.LayerNorm(d_model)
+        self.norm1 = RMSNorm(d_model)
         self.attn = nn.MultiheadAttention(d_model, num_heads=8, batch_first=True)
-        self.norm2 = nn.LayerNorm(d_model)
+        self.norm2 = RMSNorm(d_model)
         self.mlp = nn.Sequential(
             nn.Linear(d_model, 4 * d_model),
             nn.GELU(),
@@ -623,7 +618,7 @@ class TransformerBlock(nn.Module):
         return x
 
 class HybridGolfModel(nn.Module):
-    def __init__(self, vocab_size, d_model, num_unique_mambas=2, loops_per_mamba=2):
+    def __init__(self, vocab_size, d_model, num_unique_mambas=3, loops_per_mamba=1):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
@@ -633,7 +628,7 @@ class HybridGolfModel(nn.Module):
         self.embedding = nn.Embedding(vocab_size, d_model)
         self.mamba_layers = nn.ModuleList([MambaBlock(d_model) for _ in range(num_unique_mambas)])
         self.transformer_layer = TransformerBlock(d_model)
-        self.final_norm = nn.LayerNorm(d_model)
+        self.final_norm = RMSNorm(d_model)
         
         self.head = nn.Linear(d_model, vocab_size, bias=False)
         self.head.weight = self.embedding.weight
