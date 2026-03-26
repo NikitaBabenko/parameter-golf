@@ -501,13 +501,9 @@ class DistributedTokenLoader:
         return x.to(self.device, non_blocking=True), y.to(self.device, non_blocking=True)
 
 # -----------------------------
-# HYBRID GOLF MODEL
+# PURE QAT GOLF MODEL
+# -----------------------------
 import math
-
-try:
-    from mamba_ssm.ops.selective_scan_interface import selective_scan_fn
-except ImportError:
-    selective_scan_fn = None
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -522,116 +518,75 @@ class RMSNorm(nn.Module):
         output = self._norm(x.float()).type_as(x)
         return output * self.weight
 
-@torch.compiler.disable
-def slow_selective_scan(x, dt, A, B_ssm, C_ssm, D):
-    batch, seq_len, d_inner = x.shape
-    d_state = A.shape[1]
-    y = torch.zeros((batch, seq_len, d_inner), device=x.device, dtype=x.dtype)
-    state = torch.zeros((batch, d_inner, d_state), device=x.device, dtype=torch.float32)
-    
-    dt_f = dt.float()
-    x_f = x.float()
-    B_f = B_ssm.float()
-    C_f = C_ssm.float()
-    
-    for i in range(seq_len):
-        dt_i = dt_f[:, i, :].unsqueeze(-1)
-        x_i = x_f[:, i, :].unsqueeze(-1)
-        B_i = B_f[:, i, :].unsqueeze(1)
-        C_i = C_f[:, i, :].unsqueeze(1)
-        
-        state = torch.exp(dt_i * A) * state + (dt_i * x_i * B_i)
-        y[:, i, :] = torch.sum(state * C_i, dim=-1).to(x.dtype)
-        
-    y = y + x * D
-    return y
+def fake_quantize_int8(w: torch.Tensor) -> torch.Tensor:
+    scale = w.abs().max() / 127.0
+    scale = scale.clamp(min=1e-8)
+    w_q = torch.round(w / scale) * scale
+    return w + (w_q - w).detach()
 
-class MambaBlock(nn.Module):
-    def __init__(self, d_model, d_state=64, d_conv=4, expand=2):
+class QATLinear(nn.Module):
+    def __init__(self, in_features, out_features, bias=True):
         super().__init__()
-        self.d_model = d_model
-        self.d_inner = int(expand * d_model)
-        self.d_state = d_state
-        self.dt_rank = math.ceil(d_model / 16)
-        
-        self.norm = RMSNorm(d_model)
-        self.in_proj = nn.Linear(d_model, self.d_inner * 2, bias=False)
-        
-        self.conv1d = nn.Conv1d(
-            in_channels=self.d_inner,
-            out_channels=self.d_inner,
-            bias=True,
-            kernel_size=d_conv,
-            groups=self.d_inner,
-            padding=d_conv - 1,
-        )
-        
-        self.x_proj = nn.Linear(self.d_inner, self.dt_rank + d_state * 2, bias=False)
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
-        
-        A = torch.arange(1, d_state + 1).float().repeat(self.d_inner, 1)
-        self.A_log = nn.Parameter(torch.log(A))
-        self.D = nn.Parameter(torch.ones(self.d_inner))
-        
-        self.out_proj = nn.Linear(self.d_inner, d_model, bias=False)
+        self.weight = nn.Parameter(torch.empty((out_features, in_features)))
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_features))
+        else:
+            self.register_parameter('bias', None)
+        nn.init.normal_(self.weight, std=0.02)
 
     def forward(self, x):
-        batch, seq_len, _ = x.shape
-        residual = x
-        
-        x = self.norm(x)
-        
-        xz = self.in_proj(x)
-        x, z = xz.chunk(2, dim=-1)
-        
-        x = x.transpose(1, 2)
-        x = self.conv1d(x)[:, :, :seq_len]
-        x = x.transpose(1, 2)
-        x = F.silu(x)
-        
-        x_dbl = self.x_proj(x)
-        dt, B_ssm, C_ssm = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        
-        dt = F.softplus(self.dt_proj(dt))
-        A = -torch.exp(self.A_log.float())
-        y = slow_selective_scan(x, dt, A, B_ssm, C_ssm, self.D)
-            
-        out = self.out_proj(y * F.silu(z))
-        return out + residual
+        w_q = fake_quantize_int8(self.weight)
+        return F.linear(x, w_q, self.bias)
 
-class TransformerBlock(nn.Module):
+class QATTransformerBlock(nn.Module):
     def __init__(self, d_model, mlp_mult=2.0):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
-        self.attn = nn.MultiheadAttention(d_model, num_heads=8, batch_first=True)
+        
+        self.num_heads = 8
+        self.head_dim = d_model // 8
+        self.qkv_proj = QATLinear(d_model, 3 * d_model, bias=False)
+        self.o_proj = QATLinear(d_model, d_model, bias=False)
+        
         self.norm2 = RMSNorm(d_model)
         hidden_dim = int(mlp_mult * d_model)
-        self.mlp = nn.Sequential(
-            nn.Linear(d_model, hidden_dim),
-            nn.GELU(),
-            nn.Linear(hidden_dim, d_model)
-        )
+        self.mlp_in = QATLinear(d_model, hidden_dim, bias=False)
+        self.mlp_out = QATLinear(hidden_dim, d_model, bias=False)
         
     def forward(self, x):
-        attn_out, _ = self.attn(self.norm1(x), self.norm1(x), self.norm1(x), need_weights=False)
-        x = x + attn_out
-        x = x + self.mlp(self.norm2(x))
-        return x
+        # Attention
+        residual = x
+        x = self.norm1(x)
+        B, T, C = x.shape
+        qkv = self.qkv_proj(x)
+        q, k, v = qkv.split(C, dim=2)
+        q = q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
+        
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)
+        x = residual + self.o_proj(y)
+        
+        # MLP
+        residual = x
+        x = self.norm2(x)
+        x = self.mlp_in(x)
+        x = F.gelu(x)
+        x = self.mlp_out(x)
+        return residual + x
 
-class HybridGolfModel(nn.Module):
-    def __init__(self, vocab_size, d_model, mlp_mult=2.0, num_unique_mambas=3, loops_per_mamba=1):
+class PureQATGolfModel(nn.Module):
+    def __init__(self, vocab_size, d_model, num_layers=6, mlp_mult=2.0):
         super().__init__()
         self.vocab_size = vocab_size
         self.d_model = d_model
-        self.num_unique_mambas = num_unique_mambas
-        self.loops_per_mamba = loops_per_mamba
         
         self.embedding = nn.Embedding(vocab_size, d_model)
-        self.mamba_layers = nn.ModuleList([MambaBlock(d_model) for _ in range(num_unique_mambas)])
-        self.transformer_layer = TransformerBlock(d_model, mlp_mult=mlp_mult)
+        self.blocks = nn.ModuleList([QATTransformerBlock(d_model, mlp_mult) for _ in range(num_layers)])
         self.final_norm = RMSNorm(d_model)
         
-        self.head = nn.Linear(d_model, vocab_size, bias=False)
+        self.head = QATLinear(d_model, vocab_size, bias=False)
         self.head.weight = self.embedding.weight
         
         nn.init.normal_(self.embedding.weight, mean=0.0, std=0.005)
@@ -639,11 +594,9 @@ class HybridGolfModel(nn.Module):
     def forward(self, input_ids: Tensor, target_ids: Tensor = None) -> Tensor:
         x = self.embedding(input_ids)
         
-        for layer in self.mamba_layers:
-            for _ in range(self.loops_per_mamba):
-                x = layer(x)
+        for layer in self.blocks:
+            x = layer(x)
             
-        x = self.transformer_layer(x)
         x = self.final_norm(x)
         logits = self.head(x)
         
@@ -754,11 +707,11 @@ def main() -> None:
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
-    base_model = HybridGolfModel(
+    base_model = PureQATGolfModel(
         vocab_size=args.vocab_size,
         d_model=args.model_dim,
-        num_unique_mambas=2,
-        loops_per_mamba=2
+        num_layers=6,  # Force 6 layers to fit in 16MB int8
+        mlp_mult=args.mlp_mult
     ).to(device).bfloat16()
     restore_low_dim_params_to_fp32(base_model)
     # compiled_model = torch.compile(base_model, dynamic=False)
