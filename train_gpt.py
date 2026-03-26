@@ -89,6 +89,7 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 500))
+    muon_wd = float(os.environ.get("MUON_WD", 0.0))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -125,10 +126,10 @@ def zeropower_via_newtonschulz5(G: Tensor, steps: int = 10, eps: float = 1e-7) -
 
 
 class Muon(torch.optim.Optimizer):
-    def __init__(self, params, lr: float, momentum: float, backend_steps: int, nesterov: bool = True):
+    def __init__(self, params, lr: float, momentum: float, backend_steps: int, weight_decay: float = 0.0, nesterov: bool = True):
         super().__init__(
             params,
-            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, nesterov=nesterov),
+            dict(lr=lr, momentum=momentum, backend_steps=backend_steps, weight_decay=weight_decay, nesterov=nesterov),
         )
 
     @torch.no_grad()
@@ -177,6 +178,12 @@ class Muon(torch.optim.Optimizer):
             curr = 0
             for p in params:
                 g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                
+                # --- NEW: Decoupled Weight Decay ---
+                if group["weight_decay"] > 0.0:
+                    p.data.mul_(1.0 - lr * group["weight_decay"])
+                # -----------------------------------
+                
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
 
@@ -993,6 +1000,7 @@ def main() -> None:
         lr=args.matrix_lr,
         momentum=args.muon_momentum,
         backend_steps=args.muon_backend_steps,
+        weight_decay=args.muon_wd,
     )
     for group in optimizer_muon.param_groups:
         group["base_lr"] = args.matrix_lr
@@ -1117,9 +1125,9 @@ def main() -> None:
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        should_validate = last_step or step == 0 or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
-        # Всегда валидируем на нулевом шаге для проверки инициализации, даже если skip_eval=True
-        if should_validate and (not args.skip_eval or step == 0):
+        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        # Валидируем на нулевом шаге только если не включен быстрый тест (skip_eval=False)
+        if should_validate and not args.skip_eval:
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(
