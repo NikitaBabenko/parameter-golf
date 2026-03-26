@@ -829,8 +829,8 @@ def main() -> None:
     base_model = HybridHyenaGolfModel(
         vocab_size=args.vocab_size,
         d_model=args.model_dim,
-        num_hyena=6,
-        num_attn=1,
+        num_hyena=10,
+        num_attn=2,
         mlp_mult=args.mlp_mult
     ).to(device).bfloat16()
     restore_low_dim_params_to_fp32(base_model)
@@ -912,15 +912,36 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
-        if args.warmdown_iters <= 0:
+        # Time-based Cosine Decay
+        # Целевое время охлаждения - 590 секунд (оставляем 10 сек на сохранение до лимита 600)
+        target_decay_time_ms = 590.0 * 1000.0
+        
+        # Защита: если мы обучаемся локально без лимита времени (например, 3600 сек), 
+        # то подстраиваем таргет под текущий лимит, оставляя 10 сек зазора
+        if max_wallclock_ms is not None and max_wallclock_ms > 0:
+            target_decay_time_ms = min(target_decay_time_ms, max_wallclock_ms - 10000.0)
+            
+        warmup_time_ms = 0.0 # Для начала игнорируем время вармапа, так как он идет по шагам
+        
+        # Если мы еще в фазе прогрева по шагам (обычно это первые секунды)
+        if step < args.warmup_steps:
+            return (step + 1) / max(args.warmup_steps, 1)
+            
+        # Защита от деления на ноль, если таргет почему-то меньше 0
+        if target_decay_time_ms <= 0:
             return 1.0
-        if max_wallclock_ms is None:
-            warmdown_start = max(args.iterations - args.warmdown_iters, 0)
-            return max((args.iterations - step) / max(args.warmdown_iters, 1), 0.0) if warmdown_start <= step < args.iterations else 1.0
-        step_ms = elapsed_ms / max(step, 1)
-        warmdown_ms = args.warmdown_iters * step_ms
-        remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
-        return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
+
+        # Если время вышло - держим LR на минимуме (0.0)
+        if elapsed_ms >= target_decay_time_ms:
+            return 0.0
+
+        # Вычисляем прогресс от 0.0 до 1.0 на основе прошедшего времени
+        decay_ratio = elapsed_ms / target_decay_time_ms
+        decay_ratio = min(max(decay_ratio, 0.0), 1.0)
+        
+        # Cosine decay: от 1.0 (в начале) до 0.0 (в конце)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return coeff
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
