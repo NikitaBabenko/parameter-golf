@@ -108,6 +108,12 @@ class Hyperparameters:
     # QAT
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
 
+    # MTP (Multi-Token Prediction): auxiliary loss for next+2, next+3 tokens.
+    # Heads are training-only and NOT saved to the submission artifact.
+    mtp_enabled = bool(int(os.environ.get("MTP_ENABLED", "0")))
+    mtp_alpha = float(os.environ.get("MTP_ALPHA", "0.2"))
+    mtp_n = int(os.environ.get("MTP_N", "2"))  # number of extra heads (k=2..mtp_n+1)
+
     # Misc
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
@@ -702,8 +708,11 @@ class GPT(nn.Module):
         logit_softcap: float, rope_base: float, qk_gain_init: float,
         bigram_vocab_size: int = 0, bigram_dim: int = 128,
         xsa_last_n: int = 0,
+        mtp_n: int = 0, mtp_alpha: float = 0.2,
     ):
         super().__init__()
+        self.vocab_size = vocab_size
+        self.mtp_alpha = mtp_alpha
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
@@ -727,6 +736,10 @@ class GPT(nn.Module):
         if xsa_last_n > 0:
             for i in range(max(0, num_layers - xsa_last_n), num_layers):
                 self.blocks[i].attn.use_xsa = True
+        # MTP heads: predict tokens at t+2, t+3, ... (training-only, not exported)
+        self.mtp_heads = nn.ModuleList([
+            nn.Linear(model_dim, vocab_size, bias=False) for _ in range(mtp_n)
+        ]) if mtp_n > 0 else None
         self._init_weights()
 
     def _init_weights(self) -> None:
@@ -771,6 +784,7 @@ class GPT(nn.Module):
             return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
         # Training: compute loss directly
+        # x: [B, T, D],  target_ids: [B, T]
         x_flat = x.reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -778,7 +792,22 @@ class GPT(nn.Module):
         else:
             logits_proj = self.lm_head(x_flat)
         logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        loss = F.cross_entropy(logits.float(), targets, reduction="mean")
+
+        # MTP auxiliary losses: head k predicts token at t+(k+1) from hidden state at t.
+        # k=0 → offset 2 (t+2), k=1 → offset 3 (t+3), etc.
+        if self.mtp_heads is not None:
+            mtp_loss = x.new_zeros(())
+            for k, head in enumerate(self.mtp_heads):
+                offset = k + 2  # predict this many steps ahead
+                # h[:, :T-offset+1, :] predicts target_ids[:, offset-1:]
+                # (target_ids[t] = input[t+1], so input[t+offset] = target_ids[t+offset-1])
+                h_in = x[:, : x.size(1) - offset + 1, :].reshape(-1, x.size(-1))
+                t_out = target_ids[:, offset - 1 :].reshape(-1)
+                mtp_loss = mtp_loss + F.cross_entropy(head(h_in).float(), t_out, reduction="mean")
+            loss = loss + self.mtp_alpha * mtp_loss
+
+        return loss
 
 
 # -----------------------------
@@ -990,6 +1019,8 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
         xsa_last_n=args.xsa_last_n,
+        mtp_n=args.mtp_n if args.mtp_enabled else 0,
+        mtp_alpha=args.mtp_alpha,
     ).to(device).bfloat16()
 
     for module in base_model.modules():
@@ -1051,6 +1082,13 @@ def main() -> None:
         fused=use_fused,
     )
     optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    if base_model.mtp_heads is not None:
+        mtp_params = list(base_model.mtp_heads.parameters())
+        optimizer_mtp = torch.optim.Adam(
+            [{"params": mtp_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
+            betas=(args.beta1, args.beta2), eps=args.adam_eps, fused=use_fused,
+        )
+        optimizers.append(optimizer_mtp)
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1061,7 +1099,9 @@ def main() -> None:
         optimizers.insert(1, optimizer_head)
 
     n_params = sum(p.numel() for p in base_model.parameters())
-    log0(f"model_params:{n_params}")
+    n_export_params = sum(p.numel() for n, p in base_model.named_parameters() if not n.startswith("mtp_heads"))
+    log0(f"model_params:{n_params} export_params:{n_export_params}"
+         + (f" mtp_n:{args.mtp_n} mtp_alpha:{args.mtp_alpha}" if args.mtp_enabled else ""))
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(f"xsa_last_n:{args.xsa_last_n} bigram_vocab_size:{args.bigram_vocab_size}")
@@ -1268,15 +1308,19 @@ def main() -> None:
     # SERIALIZATION + ROUNDTRIP
     # -----------------------------
 
+    # State dict without training-only MTP heads
+    def _export_state_dict(model: nn.Module) -> dict:
+        return {k: v for k, v in model.state_dict().items() if not k.startswith("mtp_heads")}
+
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
+        torch.save(_export_state_dict(base_model), "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
 
     if not args.skip_eval:
-        sd_cpu = {k: v.detach().cpu() for k, v in base_model.state_dict().items()}
+        sd_cpu = {k: v.detach().cpu() for k, v in _export_state_dict(base_model).items()}
         quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"})
         quant_buf = io.BytesIO()
         torch.save({"w": quant_result, "m": quant_meta}, quant_buf)

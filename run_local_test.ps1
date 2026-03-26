@@ -13,9 +13,10 @@ $env:GRAD_CLIP_NORM="0.3"
 $env:QAT_ENABLED="0"
 $env:USE_COMPILE="0"
 
-# Data paths (local data in parameter-golf_old)
-$env:DATA_PATH="../parameter-golf_old/data/datasets/fineweb10B_sp1024"
-$env:TOKENIZER_PATH="../parameter-golf_old/data/tokenizers/fineweb_1024_bpe.model"
+# Data paths (HuggingFace cache)
+$HF_SNAP="$env:USERPROFILE\.cache\huggingface\hub\datasets--willdepueoai--parameter-golf\snapshots\a85b0e6035c3c94bc23685a07c81a8f3bf89db80\datasets"
+$env:DATA_PATH="$HF_SNAP\datasets\fineweb10B_sp1024"
+$env:TOKENIZER_PATH="$HF_SNAP\tokenizers\fineweb_1024_bpe.model"
 
 # Small batch for local GPU
 $env:TRAIN_BATCH_TOKENS=65536
