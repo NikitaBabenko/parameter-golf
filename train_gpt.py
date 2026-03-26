@@ -63,10 +63,13 @@ class Hyperparameters:
     
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    skip_eval = bool(int(os.environ.get("SKIP_EVAL", "0")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_hyena = int(os.environ.get("NUM_HYENA", 7))
+    num_attn = int(os.environ.get("NUM_ATTN", 1))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -625,8 +628,8 @@ class CausalFNetBlock(nn.Module):
         self.norm1 = RMSNorm(d_model)
         
         # ДОБАВЛЯЕМ ГОЛОВЫ
-        self.num_heads = 8
-        self.head_dim = d_model // 8
+        self.num_heads = int(os.environ.get("NUM_HEADS", 8))
+        self.head_dim = d_model // self.num_heads
         
         self.in_proj = QATLinear(d_model, 2 * d_model, bias=False)
         self.o_proj = QATLinear(d_model, d_model, bias=False)
@@ -689,8 +692,8 @@ class QATTransformerBlock(nn.Module):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
         
-        self.num_heads = 8
-        self.head_dim = d_model // 8
+        self.num_heads = int(os.environ.get("NUM_HEADS", 8))
+        self.head_dim = d_model // self.num_heads
         self.qkv_proj = QATLinear(d_model, 3 * d_model, bias=False)
         self.o_proj = QATLinear(d_model, d_model, bias=False)
         
@@ -727,8 +730,8 @@ class VanillaTransformerBlock(nn.Module):
         super().__init__()
         self.norm1 = RMSNorm(d_model)
         
-        self.num_heads = 8
-        self.head_dim = d_model // 8
+        self.num_heads = int(os.environ.get("NUM_HEADS", 8))
+        self.head_dim = d_model // self.num_heads
         self.qkv_proj = nn.Linear(d_model, 3 * d_model, bias=False)
         self.o_proj = nn.Linear(d_model, d_model, bias=False)
         
@@ -759,40 +762,6 @@ class VanillaTransformerBlock(nn.Module):
         x = F.gelu(x)
         x = self.mlp_out(x)
         return residual + x
-
-class BigramHash(nn.Module):
-    def __init__(self, d_model, hash_size=20480, emb_dim=64):
-        super().__init__()
-        self.hash_size = hash_size
-        self.bigram_emb = nn.Embedding(hash_size, emb_dim)
-        self.proj = nn.Linear(emb_dim, d_model, bias=False)
-        self.p1 = 31337
-
-    def forward(self, input_ids):
-        B, T = input_ids.shape
-        shifted_ids = F.pad(input_ids[:, :-1], (1, 0), value=0)
-        h = ((shifted_ids * self.p1) ^ input_ids) % self.hash_size
-        emb = self.bigram_emb(h)
-        return self.proj(emb)
-
-class TrigramHash(nn.Module):
-    def __init__(self, d_model, hash_size=10240, emb_dim=64):
-        super().__init__()
-        self.hash_size = hash_size
-        self.trigram_emb = nn.Embedding(hash_size, emb_dim)
-        self.proj = nn.Linear(emb_dim, d_model, bias=False)
-        self.p1 = 31337
-        self.p2 = 179424673
-
-    def forward(self, input_ids):
-        B, T = input_ids.shape
-        t_i = input_ids
-        t_minus_1 = F.pad(input_ids[:, :-1], (1, 0), value=0)
-        t_minus_2 = F.pad(input_ids[:, :-2], (2, 0), value=0)
-        
-        h = ((t_minus_2 * self.p1) ^ (t_minus_1 * self.p2) ^ t_i) % self.hash_size
-        emb = self.trigram_emb(h)
-        return self.proj(emb)
 
 class BigramHash(nn.Module):
     def __init__(self, d_model, hash_size=20480, emb_dim=64):
@@ -860,7 +829,7 @@ class HybridHyenaGolfModel(nn.Module):
 
         # Применяем Orthogonal Initialization ко всем Linear слоям (кроме хешей, там уже сделано)
         for name, module in self.named_modules():
-            if isinstance(module, nn.Linear) and 'proj' in name or 'mlp' in name:
+            if isinstance(module, nn.Linear) and ('proj' in name or 'mlp' in name):
                 nn.init.orthogonal_(module.weight)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor = None) -> Tensor:
@@ -990,8 +959,8 @@ def main() -> None:
     base_model = HybridHyenaGolfModel(
         vocab_size=args.vocab_size,
         d_model=args.model_dim,
-        num_hyena=7,
-        num_attn=1,
+        num_hyena=args.num_hyena,
+        num_attn=args.num_attn,
         mlp_mult=args.mlp_mult
     ).to(device).bfloat16()
     restore_low_dim_params_to_fp32(base_model)
@@ -1073,20 +1042,24 @@ def main() -> None:
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
-        # Time-based Cosine Decay
-        # Целевое время охлаждения - 590 секунд (оставляем 10 сек на сохранение до лимита 600)
-        target_decay_time_ms = 590.0 * 1000.0
-        
-        # Защита: если мы обучаемся локально без лимита времени (например, 3600 сек), 
-        # то подстраиваем таргет под текущий лимит, оставляя 10 сек зазора
-        if max_wallclock_ms is not None and max_wallclock_ms > 0:
-            target_decay_time_ms = min(target_decay_time_ms, max_wallclock_ms - 10000.0)
-            
-        warmup_time_ms = 0.0 # Для начала игнорируем время вармапа, так как он идет по шагам
-        
         # Если мы еще в фазе прогрева по шагам (обычно это первые секунды)
         if step < args.warmup_steps:
             return (step + 1) / max(args.warmup_steps, 1)
+            
+        if max_wallclock_ms is None or max_wallclock_ms <= 0:
+            # Step-based Cosine Decay (Исследовательский режим)
+            progress = (step - args.warmup_steps) / max(args.iterations - args.warmup_steps, 1)
+            progress = min(max(progress, 0.0), 1.0)
+            return 0.5 * (1.0 + math.cos(math.pi * progress))
+
+        # Time-based Cosine Decay (Прод-режим)
+        # Целевое время охлаждения - 590 секунд (оставляем 10 сек на сохранение до лимита 600)
+        target_decay_time_ms = 590.0 * 1000.0
+        
+        # Защита: если мы обучаемся локально с лимитом времени, 
+        # то подстраиваем таргет под текущий лимит, оставляя 10 сек зазора
+        if max_wallclock_ms is not None and max_wallclock_ms > 0:
+            target_decay_time_ms = min(target_decay_time_ms, max_wallclock_ms - 10000.0)
             
         # Защита от деления на ноль, если таргет почему-то меньше 0
         if target_decay_time_ms <= 0:
@@ -1101,8 +1074,7 @@ def main() -> None:
         decay_ratio = min(max(decay_ratio, 0.0), 1.0)
         
         # Cosine decay: от 1.0 (в начале) до 0.0 (в конце)
-        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-        return coeff
+        return 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
@@ -1145,8 +1117,9 @@ def main() -> None:
     while True:
         last_step = step == args.iterations or (stop_after_step is not None and step >= stop_after_step)
 
-        should_validate = last_step or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
-        if should_validate:
+        should_validate = last_step or step == 0 or (args.val_loss_every > 0 and step % args.val_loss_every == 0)
+        # Всегда валидируем на нулевом шаге для проверки инициализации, даже если skip_eval=True
+        if should_validate and (not args.skip_eval or step == 0):
             torch.cuda.synchronize()
             training_time_ms += 1000.0 * (time.perf_counter() - t0)
             val_loss, val_bpb = eval_val(
@@ -1254,50 +1227,52 @@ def main() -> None:
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
-    quant_buf = io.BytesIO()
-    torch.save(quant_obj, quant_buf)
-    quant_raw = quant_buf.getvalue()
-    quant_blob = zlib.compress(quant_raw, level=9)
-    quant_raw_bytes = len(quant_raw)
-    if master_process:
-        with open("final_model.int8.ptz", "wb") as f:
-            f.write(quant_blob)
-        quant_file_bytes = os.path.getsize("final_model.int8.ptz")
-        code_bytes = len(code.encode("utf-8"))
-        ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
-        log0(
-            f"Serialized model int8+zlib: {quant_file_bytes} bytes "
-            f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
-        )
-        log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
+    if not args.skip_eval:
+        quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+        quant_buf = io.BytesIO()
+        torch.save(quant_obj, quant_buf)
+        quant_raw = quant_buf.getvalue()
+        quant_blob = zlib.compress(quant_raw, level=9)
+        quant_raw_bytes = len(quant_raw)
+        if master_process:
+            with open("final_model.int8.ptz", "wb") as f:
+                f.write(quant_blob)
+            quant_file_bytes = os.path.getsize("final_model.int8.ptz")
+            code_bytes = len(code.encode("utf-8"))
+            ratio = quant_stats["baseline_tensor_bytes"] / max(quant_stats["int8_payload_bytes"], 1)
+            log0(
+                f"Serialized model int8+zlib: {quant_file_bytes} bytes "
+                f"(payload:{quant_stats['int8_payload_bytes']} raw_torch:{quant_raw_bytes} payload_ratio:{ratio:.2f}x)"
+            )
+            log0(f"Total submission size int8+zlib: {quant_file_bytes + code_bytes} bytes")
 
-    if distributed:
-        dist.barrier()
-    with open("final_model.int8.ptz", "rb") as f:
-        quant_blob_disk = f.read()
-    quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
-    base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
-    torch.cuda.synchronize()
-    t_qeval = time.perf_counter()
-    q_val_loss, q_val_bpb = eval_val(
-        args,
-        model,
-        rank,
-        world_size,
-        device,
-        grad_accum_steps,
-        val_tokens,
-        base_bytes_lut,
-        has_leading_space_lut,
-        is_boundary_token_lut,
-    )
-    torch.cuda.synchronize()
-    log0(
-        f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
-        f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
-    )
-    log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
+        if distributed:
+            dist.barrier()
+        with open("final_model.int8.ptz", "rb") as f:
+            quant_blob_disk = f.read()
+        quant_state = torch.load(io.BytesIO(zlib.decompress(quant_blob_disk)), map_location="cpu")
+        base_model.load_state_dict(dequantize_state_dict_int8(quant_state), strict=True)
+        torch.cuda.synchronize()
+        t_qeval = time.perf_counter()
+        if not args.skip_eval:
+            q_val_loss, q_val_bpb = eval_val(
+                args,
+                model,
+                rank,
+                world_size,
+                device,
+                grad_accum_steps,
+                val_tokens,
+                base_bytes_lut,
+                has_leading_space_lut,
+                is_boundary_token_lut,
+            )
+            torch.cuda.synchronize()
+            log0(
+                f"final_int8_zlib_roundtrip val_loss:{q_val_loss:.4f} val_bpb:{q_val_bpb:.4f} "
+                f"eval_time:{1000.0 * (time.perf_counter() - t_qeval):.0f}ms"
+            )
+            log0(f"final_int8_zlib_roundtrip_exact val_loss:{q_val_loss:.8f} val_bpb:{q_val_bpb:.8f}")
 
     if distributed:
         dist.destroy_process_group()
