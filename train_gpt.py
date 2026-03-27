@@ -117,6 +117,17 @@ class Hyperparameters:
     mtp_alpha = float(os.environ.get("MTP_ALPHA", "0.2"))
     mtp_n = int(os.environ.get("MTP_N", "2"))  # number of extra heads (k=2..mtp_n+1)
 
+    # Stochastic Depth (LayerDrop): randomly skip layers during training.
+    # Saves ~10-15% compute → more iterations in 10 min. 0.0 = disabled.
+    stochastic_depth_rate = float(os.environ.get("STOCHASTIC_DEPTH_RATE", "0.0"))
+
+    # Recycled Hidden States: prepend detached hidden states from previous batch
+    # as memory prefix for attention. 0 = disabled.
+    recycle_mem_tokens = int(os.environ.get("RECYCLE_MEM_TOKENS", "0"))
+
+    # Soft MoE: number of experts per MLP. 0 or 1 = standard MLP.
+    moe_num_experts = int(os.environ.get("MOE_NUM_EXPERTS", "0"))
+
     # Misc
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
@@ -683,15 +694,52 @@ class MLP(nn.Module):
         return self.proj(x.square())
 
 
+class SoftMoEMLP(nn.Module):
+    """Soft Mixture of Experts: N smaller expert MLPs with learned soft routing.
+    Total params ≈ single MLP (each expert has hidden_dim/N), but tokens get
+    specialized combinations of experts."""
+    def __init__(self, dim: int, mlp_mult: float, num_experts: int, leaky: bool = True):
+        super().__init__()
+        self.num_experts = num_experts
+        self.leaky = leaky
+        expert_hidden = int(mlp_mult * dim) // num_experts
+        self.experts = nn.ModuleList([
+            nn.ModuleDict({
+                "fc": CastedLinear(dim, expert_hidden, bias=False),
+                "proj": CastedLinear(expert_hidden, dim, bias=False),
+            })
+            for _ in range(num_experts)
+        ])
+        for expert in self.experts:
+            expert["proj"]._zero_init = True
+        # Tiny router: dim → num_experts
+        self.gate = nn.Linear(dim, num_experts, bias=False)
+
+    def forward(self, x: Tensor) -> Tensor:
+        # x: [B, T, D]
+        gate_logits = self.gate(x)  # [B, T, E]
+        gate_weights = F.softmax(gate_logits, dim=-1)  # [B, T, E]
+        out = x.new_zeros(x.shape)
+        for i, expert in enumerate(self.experts):
+            h = expert["fc"](x)
+            h = F.leaky_relu(h, negative_slope=0.5) if self.leaky else torch.relu(h)
+            h = expert["proj"](h.square())
+            out = out + gate_weights[:, :, i:i+1] * h
+        return out
+
+
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
                  mlp_mult: float, rope_base: float, qk_gain_init: float,
-                 leaky_relu: bool = True):
+                 leaky_relu: bool = True, moe_num_experts: int = 0):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult, leaky=leaky_relu)
+        if moe_num_experts > 1:
+            self.mlp = SoftMoEMLP(dim, mlp_mult, moe_num_experts, leaky=leaky_relu)
+        else:
+            self.mlp = MLP(dim, mlp_mult, leaky=leaky_relu)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -716,10 +764,15 @@ class GPT(nn.Module):
         xsa_last_n: int = 0,
         mtp_n: int = 0, mtp_alpha: float = 0.2,
         leaky_relu: bool = True,
+        stochastic_depth_rate: float = 0.0,
+        moe_num_experts: int = 0,
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self.mtp_alpha = mtp_alpha
+        self._drop_rate = stochastic_depth_rate
+        self._recycle_n = 0  # set from outside via args.recycle_mem_tokens
+        self._recycled_mem = None
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
@@ -733,7 +786,7 @@ class GPT(nn.Module):
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([
             Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
-                  leaky_relu=leaky_relu)
+                  leaky_relu=leaky_relu, moe_num_experts=moe_num_experts)
             for _ in range(num_layers)
         ])
         self.final_norm = RMSNorm()
@@ -770,16 +823,47 @@ class GPT(nn.Module):
             x = x + self.bigram(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x = self.smear(x)
+
+        # Recycled hidden states: prepend detached memory from previous batch
+        mem_len = 0
+        recycled_mem = getattr(self, "_recycled_mem", None)
+        if recycled_mem is not None and recycled_mem.size(0) == x.size(0):
+            mem_len = recycled_mem.size(1)
+            x = torch.cat([recycled_mem, x], dim=1)
+
         x0 = x
         skips: list[Tensor] = []
+        num_layers = len(self.blocks)
 
         for i in range(self.num_encoder_layers):
+            # Stochastic depth: linearly increasing drop rate per layer
+            if self.training and self._drop_rate > 0.0:
+                layer_drop = self._drop_rate * (i + 1) / num_layers
+                if random.random() < layer_drop:
+                    skips.append(x)
+                    continue
             x = self.blocks[i](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
+            layer_idx = self.num_encoder_layers + i
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            # Stochastic depth for decoder layers
+            if self.training and self._drop_rate > 0.0:
+                layer_drop = self._drop_rate * (layer_idx + 1) / num_layers
+                if random.random() < layer_drop:
+                    continue
+            x = self.blocks[layer_idx](x, x0)
+
+        # Save tail of pre-norm hidden states for next batch's recycled memory
+        recycle_n = getattr(self, "_recycle_n", 0)
+        if self.training and recycle_n > 0:
+            # Take last recycle_n tokens of current input (after mem_len offset)
+            self._recycled_mem = x[:, -recycle_n:, :].detach()
+
+        # Strip memory prefix — only keep current tokens
+        if mem_len > 0:
+            x = x[:, mem_len:, :]
 
         x = self.final_norm(x)
 
@@ -1030,7 +1114,11 @@ def main() -> None:
         mtp_n=args.mtp_n if args.mtp_enabled else 0,
         mtp_alpha=args.mtp_alpha,
         leaky_relu=args.leaky_relu_act,
+        stochastic_depth_rate=args.stochastic_depth_rate,
+        moe_num_experts=args.moe_num_experts,
     ).to(device).bfloat16()
+
+    base_model._recycle_n = args.recycle_mem_tokens
 
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1367,6 +1455,8 @@ def main() -> None:
             logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
             bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
             xsa_last_n=args.xsa_last_n,
+            leaky_relu=args.leaky_relu_act,
+            moe_num_experts=args.moe_num_experts,
         ).to(device).bfloat16()
         for m in eval_model.modules():
             if isinstance(m, CastedLinear):
