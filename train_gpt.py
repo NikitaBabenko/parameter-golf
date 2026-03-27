@@ -108,6 +108,9 @@ class Hyperparameters:
     # QAT
     qat_enabled = bool(int(os.environ.get("QAT_ENABLED", "0")))
 
+    # Activation: LeakyReLU(0.5)² vs ReLU² — proven -0.003 BPB on leaderboard
+    leaky_relu_act = bool(int(os.environ.get("USE_LEAKY_RELU", "1")))
+
     # MTP (Multi-Token Prediction): auxiliary loss for next+2, next+3 tokens.
     # Heads are training-only and NOT saved to the submission artifact.
     mtp_enabled = bool(int(os.environ.get("MTP_ENABLED", "0")))
@@ -666,26 +669,29 @@ class BigramHashEmbedding(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: float):
+    def __init__(self, dim: int, mlp_mult: float, leaky: bool = True):
         super().__init__()
         hidden = int(mlp_mult * dim)
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
+        self.leaky = leaky
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
-        return self.proj(x.square())  # ReLU^2 activation
+        x = self.fc(x)
+        x = F.leaky_relu(x, negative_slope=0.5) if self.leaky else torch.relu(x)
+        return self.proj(x.square())
 
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, num_kv_heads: int,
-                 mlp_mult: float, rope_base: float, qk_gain_init: float):
+                 mlp_mult: float, rope_base: float, qk_gain_init: float,
+                 leaky_relu: bool = True):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, leaky=leaky_relu)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -709,6 +715,7 @@ class GPT(nn.Module):
         bigram_vocab_size: int = 0, bigram_dim: int = 128,
         xsa_last_n: int = 0,
         mtp_n: int = 0, mtp_alpha: float = 0.2,
+        leaky_relu: bool = True,
     ):
         super().__init__()
         self.vocab_size = vocab_size
@@ -725,7 +732,8 @@ class GPT(nn.Module):
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.blocks = nn.ModuleList([
-            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init)
+            Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init,
+                  leaky_relu=leaky_relu)
             for _ in range(num_layers)
         ])
         self.final_norm = RMSNorm()
@@ -1021,6 +1029,7 @@ def main() -> None:
         xsa_last_n=args.xsa_last_n,
         mtp_n=args.mtp_n if args.mtp_enabled else 0,
         mtp_alpha=args.mtp_alpha,
+        leaky_relu=args.leaky_relu_act,
     ).to(device).bfloat16()
 
     for module in base_model.modules():
@@ -1104,7 +1113,8 @@ def main() -> None:
          + (f" mtp_n:{args.mtp_n} mtp_alpha:{args.mtp_alpha}" if args.mtp_enabled else ""))
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
-    log0(f"xsa_last_n:{args.xsa_last_n} bigram_vocab_size:{args.bigram_vocab_size}")
+    log0(f"xsa_last_n:{args.xsa_last_n} bigram_vocab_size:{args.bigram_vocab_size} "
+         f"activation:{'LeakyReLU(0.5)^2' if args.leaky_relu_act else 'ReLU^2'}")
     log0(f"ema_enabled:{args.ema_enabled} ema_decay:{args.ema_decay}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
