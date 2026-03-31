@@ -153,6 +153,13 @@ class Hyperparameters:
     ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
     ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
 
+    # RYS (Repeat Your Steps): repeat specified layers at inference time only.
+    # e.g. "5,6,7" to repeat decoder layers 5-7 after the main forward pass.
+    rys_layers = os.environ.get("RYS_LAYERS", "")
+
+    # Eval-only mode: path to a .ptz checkpoint to skip training and only run eval.
+    eval_only = os.environ.get("EVAL_ONLY", "")
+
     # Misc
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
@@ -798,6 +805,7 @@ class GPT(nn.Module):
         self._drop_rate = stochastic_depth_rate
         self._recycle_n = 0  # set from outside via args.recycle_mem_tokens
         self._recycled_mem = None
+        self._rys_layers: list[int] = []  # set from outside via args.rys_layers
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
@@ -879,6 +887,12 @@ class GPT(nn.Module):
                 if random.random() < layer_drop:
                     continue
             x = self.blocks[layer_idx](x, x0)
+
+        # RYS: repeat specified layers at inference time for extra "thinking"
+        rys_layers = getattr(self, "_rys_layers", [])
+        if not self.training and rys_layers:
+            for i in rys_layers:
+                x = self.blocks[i](x, x0)
 
         # Save tail of pre-norm hidden states for next batch's recycled memory
         recycle_n = getattr(self, "_recycle_n", 0)
@@ -1402,6 +1416,84 @@ def main() -> None:
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
 
     # -----------------------------
+    # EVAL-ONLY MODE: load checkpoint, run eval, exit
+    # -----------------------------
+
+    if args.eval_only:
+        log0(f"EVAL_ONLY mode: loading checkpoint from {args.eval_only}")
+        with open(args.eval_only, "rb") as f:
+            quant_blob_disk = f.read()
+        if _COMPRESSOR == "zstd":
+            raw = zstandard.ZstdDecompressor().decompress(quant_blob_disk)
+        else:
+            raw = zlib.decompress(quant_blob_disk)
+        quant_state = torch.load(io.BytesIO(raw), map_location="cpu")
+        sd_cpu = {k: v.detach().cpu() for k, v in GPT(
+            vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
+            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+            bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+            xsa_last_n=args.xsa_last_n, leaky_relu=args.leaky_relu_act,
+            moe_num_experts=args.moe_num_experts,
+        ).state_dict().items()}
+        deq_state = dequantize_mixed_int6(quant_state["w"], quant_state["m"], sd_cpu)
+
+        eval_model = GPT(
+            vocab_size=args.vocab_size, num_layers=args.num_layers, model_dim=args.model_dim,
+            num_heads=args.num_heads, num_kv_heads=args.num_kv_heads, mlp_mult=args.mlp_mult,
+            tie_embeddings=args.tie_embeddings, tied_embed_init_std=args.tied_embed_init_std,
+            logit_softcap=args.logit_softcap, rope_base=args.rope_base, qk_gain_init=args.qk_gain_init,
+            bigram_vocab_size=args.bigram_vocab_size, bigram_dim=args.bigram_dim,
+            xsa_last_n=args.xsa_last_n, leaky_relu=args.leaky_relu_act,
+            moe_num_experts=args.moe_num_experts,
+        ).to(device).bfloat16()
+        for m in eval_model.modules():
+            if isinstance(m, CastedLinear):
+                m.float()
+        restore_low_dim_params_to_fp32(eval_model)
+        if args.rys_layers:
+            eval_model._rys_layers = [int(x) for x in args.rys_layers.split(",")]
+        eval_model.load_state_dict(deq_state, strict=True)
+        log0(f"Checkpoint loaded. RYS_LAYERS={args.rys_layers or '(none)'}")
+
+        grad_accum_steps = 1
+        sw_seq_len = effective_eval_seq_len
+
+        # Sliding window eval
+        if args.eval_stride > 0 and args.eval_stride < sw_seq_len:
+            t_slide = time.perf_counter()
+            sw_val_loss, sw_val_bpb = eval_val_sliding(
+                args, eval_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride, eval_seq_len=sw_seq_len,
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            log0(f"eval_only_sliding val_loss:{sw_val_loss:.4f} val_bpb:{sw_val_bpb:.4f} "
+                 f"stride:{args.eval_stride} rys:{args.rys_layers or 'none'} "
+                 f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms")
+            log0(f"eval_only_sliding_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+
+        # Advanced eval (N-gram cache + TTT)
+        if args.ngram_eval or args.ttt_enabled:
+            t_adv = time.perf_counter()
+            adv_loss, adv_bpb = eval_val_advanced(
+                args, eval_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride, log0=log0,
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            log0(f"eval_only_advanced val_loss:{adv_loss:.4f} val_bpb:{adv_bpb:.4f} "
+                 f"ngram:{args.ngram_eval} ttt:{args.ttt_enabled} rys:{args.rys_layers or 'none'} "
+                 f"eval_time:{1000.0 * (time.perf_counter() - t_adv):.0f}ms")
+
+        if distributed:
+            dist.destroy_process_group()
+        return
+
+    # -----------------------------
     # MODEL + OPTIMIZER SETUP
     # -----------------------------
 
@@ -1430,6 +1522,8 @@ def main() -> None:
     ).to(device).bfloat16()
 
     base_model._recycle_n = args.recycle_mem_tokens
+    if args.rys_layers:
+        base_model._rys_layers = [int(x) for x in args.rys_layers.split(",")]
 
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1777,6 +1871,8 @@ def main() -> None:
             if isinstance(m, CastedLinear):
                 m.float()
         restore_low_dim_params_to_fp32(eval_model)
+        if args.rys_layers:
+            eval_model._rys_layers = [int(x) for x in args.rys_layers.split(",")]
         eval_model.load_state_dict(deq_state, strict=True)
 
         # Standard eval
