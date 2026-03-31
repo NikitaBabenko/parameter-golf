@@ -1,9 +1,9 @@
-$env:RUN_ID="local_test_gqa"
-$env:ITERATIONS=30
-$env:WARMUP_STEPS=5
-$env:WARMDOWN_ITERS=5
+$env:RUN_ID="local_test_ngram"
+$env:ITERATIONS=10
+$env:WARMUP_STEPS=3
+$env:WARMDOWN_ITERS=2
 
-# LR (defaults are tuned for 8xH100 big batch, lower for local)
+# LR
 $env:MATRIX_LR="0.04"
 $env:SCALAR_LR="0.04"
 $env:TIED_EMBED_LR="0.05"
@@ -22,29 +22,37 @@ $env:TOKENIZER_PATH="$HF_SNAP\tokenizers\fineweb_1024_bpe.model"
 $env:TRAIN_BATCH_TOKENS=65536
 $env:TRAIN_SEQ_LEN=1024
 
-# Disable validation and eval
+# Eval: enabled but small
 $env:VAL_LOSS_EVERY=-1
 $env:VAL_BATCH_SIZE=8192
 $env:TRAIN_LOG_EVERY=5
-$env:SKIP_EVAL="1"
+$env:SKIP_EVAL="0"
 
 # Disable time limit
 $env:MAX_WALLCLOCK_SECONDS=0
 
-# Architecture (use defaults mostly, but can override here)
-# $env:NUM_LAYERS=11
-# $env:MODEL_DIM=512
-# $env:NUM_HEADS=8
-# $env:NUM_KV_HEADS=4
-# $env:MLP_MULT="3.0"
-# $env:XSA_LAST_N=4
-# $env:BIGRAM_VOCAB_SIZE=4096
-# $env:BIGRAM_DIM=128
-
 # EMA off for local test speed
 $env:EMA_ENABLED="0"
 
-Write-Host "Local test: 30 steps, no eval, no QAT, no EMA"
+# --- New features ---
+$env:USE_LEAKY_RELU="1"
+$env:MTP_ENABLED="0"
+$env:STOCHASTIC_DEPTH_RATE="0.0"
+$env:RECYCLE_MEM_TOKENS="0"
+$env:MOE_NUM_EXPERTS="0"
+
+# --- N-gram eval cache ---
+$env:NGRAM_EVAL="1"
+$env:NGRAM_ORDER="5"
+$env:NGRAM_MIN_ORDER="2"
+$env:NGRAM_BUCKETS="1048576"
+$env:NGRAM_ALPHA="0.4"
+$env:NGRAM_ENTROPY_ADAPTIVE="1"
+
+# --- TTT disabled for local test ---
+$env:TTT_ENABLED="0"
+
+Write-Host "Local test: 10 steps + N-gram eval (order 5, 1M buckets)"
 Write-Host "------------------------------------------------------------------"
 
 & "$env:LOCALAPPDATA\Programs\Python\Python312\python.exe" train_gpt.py

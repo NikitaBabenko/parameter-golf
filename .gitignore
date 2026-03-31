@@ -10,3 +10,5 @@ data/docs_selected.jsonl
 .venv
 logs/
 final_model.pt
+final_model.int6.ptz
+CLAUDE.md
