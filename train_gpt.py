@@ -160,6 +160,11 @@ class Hyperparameters:
     # Eval-only mode: path to a .ptz checkpoint to skip training and only run eval.
     eval_only = os.environ.get("EVAL_ONLY", "")
 
+    # MC Dropout Ensemble (eval-time only, 0 bytes in artifact)
+    mc_ensemble = bool(int(os.environ.get("MC_ENSEMBLE", "0")))
+    mc_passes = int(os.environ.get("MC_PASSES", 8))
+    mc_drop_p = float(os.environ.get("MC_DROP_P", 0.1))
+
     # Misc
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
@@ -775,13 +780,22 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        # MC Dropout: _mc_active enables dropout even in eval mode
+        self._mc_active = False
+        self._drop_p = 0.0
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
         attn_out = self.attn(self.attn_norm(x))
+        drop = self._drop_p > 0.0 and (self.training or self._mc_active)
+        if drop:
+            attn_out = F.dropout(attn_out, p=self._drop_p, training=True)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        mlp_out = self.mlp(self.mlp_norm(x))
+        if drop:
+            mlp_out = F.dropout(mlp_out, p=self._drop_p, training=True)
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         return x
 
 
@@ -1013,6 +1027,112 @@ def eval_val_sliding(
                 tb = base_bytes_lut[tgt].to(torch.float64)
                 tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
                 byte_count += tb.sum()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = (loss_sum / token_count).item()
+    bits_per_token = val_loss / math.log(2.0)
+    tokens_per_byte = token_count.item() / byte_count.item()
+    base_model.train()
+    return val_loss, bits_per_token * tokens_per_byte
+
+
+def eval_val_ensemble(
+    args: Hyperparameters,
+    base_model: nn.Module,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+    stride: int,
+    n_passes: int = 8,
+    drop_p: float = 0.1,
+    batch_seqs: int = 32,
+    eval_seq_len: int | None = None,
+) -> tuple[float, float]:
+    """MC Dropout Ensemble: run N forward passes with dropout, average log-probs."""
+    seq_len = eval_seq_len or args.train_seq_len
+    total_tokens = val_tokens.numel() - 1
+
+    window_starts = [ws for ws in range(0, total_tokens, stride)
+                     if min(ws + seq_len, total_tokens) - ws >= 1]
+    total_windows = len(window_starts)
+
+    my_s = (total_windows * rank) // world_size
+    my_e = (total_windows * (rank + 1)) // world_size
+    my_windows = window_starts[my_s:my_e]
+
+    loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    token_count = torch.zeros((), device=device, dtype=torch.float64)
+    byte_count = torch.zeros((), device=device, dtype=torch.float64)
+
+    # Activate MC dropout on all blocks
+    base_model.eval()
+    for m in base_model.modules():
+        if isinstance(m, Block):
+            m._mc_active = True
+            m._drop_p = drop_p
+
+    # Use no_grad (NOT inference_mode — inference_mode disables dropout)
+    with torch.no_grad():
+        for bi in range(0, len(my_windows), batch_seqs):
+            batch_ws = my_windows[bi:bi + batch_seqs]
+            bsz = len(batch_ws)
+
+            x_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            y_batch = torch.zeros(bsz, seq_len, dtype=torch.int64, device=device)
+            wlens: list[int] = []
+
+            for i, ws in enumerate(batch_ws):
+                end = min(ws + seq_len, total_tokens)
+                wlen = end - ws
+                wlens.append(wlen)
+                chunk = val_tokens[ws:end + 1].to(dtype=torch.int64, device=device)
+                x_batch[i, :wlen] = chunk[:-1]
+                y_batch[i, :wlen] = chunk[1:]
+
+            # N forward passes with different dropout masks
+            log_probs_sum = None
+            for _ in range(n_passes):
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+                    logits = base_model(x_batch)
+                lp = F.log_softmax(logits.float(), dim=-1)
+                if log_probs_sum is None:
+                    log_probs_sum = lp
+                else:
+                    log_probs_sum = torch.logaddexp(log_probs_sum, lp)
+
+            avg_log_probs = log_probs_sum - math.log(n_passes)
+
+            nll = F.nll_loss(
+                avg_log_probs.reshape(-1, avg_log_probs.size(-1)),
+                y_batch.reshape(-1),
+                reduction="none",
+            ).reshape(bsz, seq_len)
+
+            for i, ws in enumerate(batch_ws):
+                wlen = wlens[i]
+                s = 0 if ws == 0 else max(wlen - stride, 0)
+                scored_nll = nll[i, s:wlen].to(torch.float64)
+                loss_sum += scored_nll.sum()
+                token_count += float(wlen - s)
+                tgt = y_batch[i, s:wlen]
+                prev = x_batch[i, s:wlen]
+                tb = base_bytes_lut[tgt].to(torch.float64)
+                tb += (has_leading_space_lut[tgt] & ~is_boundary_token_lut[prev]).to(torch.float64)
+                byte_count += tb.sum()
+
+    # Deactivate MC dropout
+    for m in base_model.modules():
+        if isinstance(m, Block):
+            m._mc_active = False
+            m._drop_p = 0.0
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(loss_sum, op=dist.ReduceOp.SUM)
@@ -1475,6 +1595,21 @@ def main() -> None:
                  f"eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms")
             log0(f"eval_only_sliding_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
 
+        # MC Dropout Ensemble eval
+        if args.mc_ensemble:
+            t_mc = time.perf_counter()
+            mc_loss, mc_bpb = eval_val_ensemble(
+                args, eval_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride, n_passes=args.mc_passes, drop_p=args.mc_drop_p,
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            log0(f"eval_only_mc_ensemble val_loss:{mc_loss:.4f} val_bpb:{mc_bpb:.4f} "
+                 f"passes:{args.mc_passes} drop_p:{args.mc_drop_p} "
+                 f"eval_time:{1000.0 * (time.perf_counter() - t_mc):.0f}ms")
+            log0(f"eval_only_mc_ensemble_exact val_loss:{mc_loss:.8f} val_bpb:{mc_bpb:.8f}")
+
         # Advanced eval (N-gram cache + TTT)
         if args.ngram_eval or args.ttt_enabled:
             t_adv = time.perf_counter()
@@ -1911,6 +2046,24 @@ def main() -> None:
                 f"stride:{args.eval_stride} eval_time:{1000.0 * (time.perf_counter() - t_slide):.0f}ms"
             )
             log0(f"final_int6_sliding_window_exact val_loss:{sw_val_loss:.8f} val_bpb:{sw_val_bpb:.8f}")
+
+        # MC Dropout Ensemble eval
+        if args.mc_ensemble:
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            t_mc = time.perf_counter()
+            mc_loss, mc_bpb = eval_val_ensemble(
+                args, eval_model, rank, world_size, device,
+                val_tokens, base_bytes_lut, has_leading_space_lut, is_boundary_token_lut,
+                stride=args.eval_stride, n_passes=args.mc_passes, drop_p=args.mc_drop_p,
+                eval_seq_len=sw_seq_len,
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            log0(f"mc_ensemble val_loss:{mc_loss:.4f} val_bpb:{mc_bpb:.4f} "
+                 f"passes:{args.mc_passes} drop_p:{args.mc_drop_p} "
+                 f"eval_time:{1000.0 * (time.perf_counter() - t_mc):.0f}ms")
+            log0(f"mc_ensemble_exact val_loss:{mc_loss:.8f} val_bpb:{mc_bpb:.8f}")
 
         # Advanced eval (N-gram cache + TTT)
         if args.ngram_eval or args.ttt_enabled:

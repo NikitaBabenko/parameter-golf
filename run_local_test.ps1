@@ -22,11 +22,11 @@ $env:TOKENIZER_PATH="$HF_SNAP\tokenizers\fineweb_1024_bpe.model"
 $env:TRAIN_BATCH_TOKENS=65536
 $env:TRAIN_SEQ_LEN=1024
 
-# Eval: enabled but small
+# Eval: skip heavy eval for smoke test (only 10 steps, BPB meaningless)
 $env:VAL_LOSS_EVERY=-1
 $env:VAL_BATCH_SIZE=8192
 $env:TRAIN_LOG_EVERY=5
-$env:SKIP_EVAL="0"
+$env:SKIP_EVAL="1"
 
 # Disable time limit
 $env:MAX_WALLCLOCK_SECONDS=0
