@@ -207,6 +207,9 @@ class Hyperparameters:
     tt_init_mode = os.environ.get("TT_INIT_MODE", "svd")
     tt_muon_mode = os.environ.get("TT_MUON_MODE", "reshape")
 
+    # V40 — Residual int4 cascade quantization (port from V35)
+    residual_quant_enabled = bool(int(os.environ.get("RESIDUAL_QUANT_ENABLED", "0")))
+
 # -----------------------------
 # MUON OPTIMIZER
 # -----------------------------
@@ -657,6 +660,48 @@ def quantize_int6_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
     return q, scale
 
 
+def quantize_int4_per_row(t: Tensor) -> tuple[Tensor, Tensor]:
+    """V40 cascade stage: int4 quantization (16 levels [-8, 7] in int8 container, fp16 scale per row).
+
+    NOTE: V35 used clamp_min(1/7) here which broke cascade: residual stages all collapse
+    to scale=0.143 → q1/q2=zeros → cascade reduces to single int4. We use torch.where
+    instead so true-zero rows get scale=1 (q=0 either way) but small residuals get
+    proportional small scale.
+    """
+    t32 = t.float()
+    if t32.ndim == 2:
+        row_max = t32.abs().amax(dim=1)
+        scale_f = torch.where(row_max > 0, row_max / 7.0, torch.ones_like(row_max))
+        scale = scale_f.to(torch.float16)
+        q = torch.clamp(torch.round(t32 / scale.float()[:, None]), -8, 7).to(torch.int8)
+        return q, scale
+    amax = t32.abs().max().item()
+    scale = torch.tensor(amax / 7.0 if amax > 0 else 1.0, dtype=torch.float16)
+    q = torch.clamp(torch.round(t32 / scale.float()), -8, 7).to(torch.int8)
+    return q, scale
+
+
+def quantize_residual_int4_cascade(t: Tensor) -> tuple[Tensor, ...]:
+    """V40: 3-stage residual int4 cascade. Returns (q0,s0, q1,s1, q2,s2).
+    q0·s0 + q1·s1 + q2·s2 ≈ t at int4×3 effective precision.
+    """
+    t32 = t.float()
+    q0, s0 = quantize_int4_per_row(t32)
+    r1 = t32 - q0.float() * s0.float()[:, None]
+    q1, s1 = quantize_int4_per_row(r1)
+    r2 = r1 - q1.float() * s1.float()[:, None]
+    q2, s2 = quantize_int4_per_row(r2)
+    return q0, s0, q1, s1, q2, s2
+
+
+def dequantize_residual_int4_cascade(
+    q0: Tensor, s0: Tensor, q1: Tensor, s1: Tensor, q2: Tensor, s2: Tensor
+) -> Tensor:
+    return (q0.float() * s0.float()[:, None]
+            + q1.float() * s1.float()[:, None]
+            + q2.float() * s2.float()[:, None])
+
+
 def _classify_param(name: str) -> str:
     if "tok_emb" in name or "lm_head" in name:
         return "embed"
@@ -667,8 +712,11 @@ def _classify_param(name: str) -> str:
     return "other"
 
 
-def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
-    """Int6 for MLP/attn weights, int8 for embeddings, fp16 passthrough for small tensors."""
+def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str],
+                        residual_quant: bool = False):
+    """Int6 for MLP/attn weights, int8 for embeddings, fp16 passthrough for small tensors.
+    When residual_quant=True (V40): use 3-stage int4 cascade for MLP/attn 2D tensors.
+    """
     result: dict[str, Tensor] = {}
     meta: dict[str, object] = {}
     for name, tensor in state_dict.items():
@@ -682,7 +730,13 @@ def mixed_quantize_int6(state_dict: dict[str, Tensor], int6_cats: set[str]):
             result[name] = t.float()
             meta[name] = "passthrough_ctrl"
             continue
-        if cat in int6_cats and t.ndim >= 1:
+        if residual_quant and cat in int6_cats and t.ndim == 2:
+            q0, s0, q1, s1, q2, s2 = quantize_residual_int4_cascade(t)
+            for j, (q, s) in enumerate([(q0, s0), (q1, s1), (q2, s2)]):
+                result[f"{name}.q{j}"] = q
+                result[f"{name}.s{j}"] = s
+            meta[name] = {"type": "int4_cascade"}
+        elif cat in int6_cats and t.ndim >= 1:
             q, s = quantize_int6_per_row(t)
             result[name + ".q"] = q
             result[name + ".scale"] = s
@@ -707,6 +761,14 @@ def dequantize_mixed_int6(result: dict[str, Tensor], meta: dict[str, object],
             t = result[name]
             if t.dtype == torch.float16 and orig_dtype in (torch.float32, torch.bfloat16):
                 t = t.to(orig_dtype)
+            out[name] = t
+            continue
+        if isinstance(info, dict) and info.get("type") == "int4_cascade":
+            t = dequantize_residual_int4_cascade(
+                result[f"{name}.q0"], result[f"{name}.s0"],
+                result[f"{name}.q1"], result[f"{name}.s1"],
+                result[f"{name}.q2"], result[f"{name}.s2"],
+            ).to(orig_dtype)
             out[name] = t
             continue
         q, s = result[name + ".q"], result[name + ".scale"]
@@ -2555,8 +2617,23 @@ def main() -> None:
     sd_cpu = {k: v.detach().cpu() for k, v in _export_state_dict(base_model).items()}
     global _GPTQ_LITE_ENABLED
     _GPTQ_LITE_ENABLED = args.gptq_lite_enabled
-    quant_result, quant_meta = mixed_quantize_int6(sd_cpu, {"mlp", "attn"})
+    quant_result, quant_meta = mixed_quantize_int6(
+        sd_cpu, {"mlp", "attn"}, residual_quant=args.residual_quant_enabled)
     _GPTQ_LITE_ENABLED = False
+
+    # V40: when cascade is ON, also report int6 baseline size for delta logging
+    if args.residual_quant_enabled and master_process:
+        _baseline_result, _baseline_meta = mixed_quantize_int6(
+            sd_cpu, {"mlp", "attn"}, residual_quant=False)
+        _baseline_buf = io.BytesIO()
+        torch.save({"w": _baseline_result, "m": _baseline_meta}, _baseline_buf)
+        _baseline_raw = _baseline_buf.getvalue()
+        if _COMPRESSOR == "zstd":
+            _baseline_blob = zstandard.ZstdCompressor(level=22).compress(_baseline_raw)
+        else:
+            _baseline_blob = zlib.compress(_baseline_raw, 9)
+        log0(f"size_compare int6+{_COMPRESSOR}: {len(_baseline_blob)} bytes")
+
     quant_buf = io.BytesIO()
     torch.save({"w": quant_result, "m": quant_meta}, quant_buf)
     quant_raw = quant_buf.getvalue()
@@ -2564,13 +2641,14 @@ def main() -> None:
         quant_blob = zstandard.ZstdCompressor(level=22).compress(quant_raw)
     else:
         quant_blob = zlib.compress(quant_raw, 9)
+    quant_tag = "cascade_int4" if args.residual_quant_enabled else "int6"
     if master_process:
         with open("final_model.int6.ptz", "wb") as f:
             f.write(quant_blob)
         quant_file_bytes = len(quant_blob)
         code_bytes = len(code.encode("utf-8"))
-        log0(f"Serialized model int6+{_COMPRESSOR}: {quant_file_bytes} bytes")
-        log0(f"Total submission size int6+{_COMPRESSOR}: {quant_file_bytes + code_bytes} bytes")
+        log0(f"Serialized model {quant_tag}+{_COMPRESSOR}: {quant_file_bytes} bytes")
+        log0(f"Total submission size {quant_tag}+{_COMPRESSOR}: {quant_file_bytes + code_bytes} bytes")
         fits = "FITS (<16MB)" if quant_file_bytes + code_bytes < 16_000_000 else "TOO BIG (>16MB)"
         log0(f"Budget check: {fits}")
 
