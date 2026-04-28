@@ -1,20 +1,47 @@
 """
 Parameter Golf — Competitive GPT training script.
 
-V40 — Maxed-Out architecture: V37 TT base + extended TT scope (attn.c_q + attn.proj)
-+ deeper stack + larger bigram vocab. Designed to consume more of the 16 MB budget.
+V40 Maxed-Out submission — designed for one-command 8xH100 cloud run.
+Just run from parameter-golf/ directory:
 
-V40 v1 scope: square TT on c_q and attn.proj. Rectangular TT for MLP/c_k/c_v and
-cascade quantization deferred to v2 once v1 cloud-validates.
+    torchrun --standalone --nproc_per_node=8 train_gpt.py
 
-Recommended runtime overrides (set via env):
-  NUM_LAYERS=15                       — 11 → 15 (+4 transformer blocks)
-  BIGRAM_VOCAB_SIZE=8192              — 4096 → 8192 (near-free win)
-  TT_APPLY_TO=attn_qkv,attn_out       — TT on c_q AND attn.proj (square dim×dim)
-  TT_ENABLED=1, TT_MAX_RANK=8, TT_MODE_SHAPE=8,8,8, TT_INIT_MODE=svd, TT_MUON_MODE=reshape
+All submission-ready parameters baked into defaults. No env-vars required.
 
-V34 advanced gates (GPTQ_LITE/PARTIAL_ROPE/LN_SCALE/PARALLEL_MUON/TTT) MUST be OFF
-during V40 smoke so the V40 signal stays isolated.
+Architecture (V37 Tensor-Train fork, extended scope + deeper stack + larger bigram):
+  NUM_LAYERS=13           — 13 transformer layers (vs 11 V29 baseline)
+  BIGRAM_VOCAB_SIZE=8192  — bigram embed table x2 (near-free win)
+  TT_ENABLED=1, TT_APPLY_TO=attn_qkv,attn_out
+                          — Tensor-Train decomposition on c_q + attn.proj (square dim*dim)
+                          — mode_shape (8,8,8), max_rank=8, TT-SVD init
+                          — Muon on 3D cores via reshape-to-2D for NS5 orthogonalization
+                          — 51x compression per matrix, frees budget for depth + bigram
+
+V34 Safe Bundle (proven leaderboard wins, all ON by default):
+  GPTQ_LITE_ENABLED=1     — clip-percentile sweep (signalrush, -0.002 BPB)
+  PARTIAL_ROPE_DIMS=16    — partial RoPE 16/64 dims (jfprincz, -0.001 BPB)
+  LN_SCALE_PER_LAYER=1    — 1/sqrt(layer+1) norm scale (jfprincz, -0.001 BPB)
+  EMA_ENABLED=1           — exp moving avg + warmdown copy (~-0.005 BPB)
+  LOGIT_TEMP_CAL=1        — post-train T calibration
+
+Disabled (incompatible with V40 v1 or known-broken):
+  TTT_ENABLED=0           — to avoid eval-rule edge cases
+  PARALLEL_MUON_ENABLED=0 — incompatible with TTLinear in v1 (3D bank conflict)
+  RESIDUAL_QUANT_ENABLED=0 — V35 cascade idea closed (clamp_min fix exposed
+                             that real cascade is 3-5x larger artifact than int6)
+
+Local 1xH100 ablation (5000 steps, V34 SafeBundle OFF for V40 isolation):
+  V40-A 11L baseline:  sliding val_bpb 1.3288, artifact 14.47 MB (zlib)
+  V40-B 15L (TOO BIG): sliding val_bpb 1.3181, artifact 16.47 MB (zstd) — DQ
+  V40-D 13L (this):    roundtrip val_bpb 1.3375, artifact 14.55 MB (zstd) — FITS
+
+Production 8xH100 prediction (full V34 SafeBundle ON, defaults):
+  Expected sliding val_bpb: 1.10-1.13
+  Expected artifact:        ~15.0 MB (FITS with ~1 MB headroom)
+
+Local single-GPU test override (RTX 4060):
+  USE_COMPILE=0 SKIP_EVAL=1 ITERATIONS=200 TRAIN_BATCH_TOKENS=4096 TRAIN_SEQ_LEN=512 \\
+      python train_gpt.py
 """
 
 from __future__ import annotations
@@ -76,7 +103,7 @@ class Hyperparameters:
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 1200))
-    warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
+    warmup_steps = int(os.environ.get("WARMUP_STEPS", 200))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 786_432))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 2048))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 2048))
@@ -85,7 +112,7 @@ class Hyperparameters:
 
     # Model shape
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
-    num_layers = int(os.environ.get("NUM_LAYERS", 11))
+    num_layers = int(os.environ.get("NUM_LAYERS", 13))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -97,7 +124,7 @@ class Hyperparameters:
 
     # Architecture extras
     xsa_last_n = int(os.environ.get("XSA_LAST_N", 4))
-    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 4096))
+    bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 8192))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
 
     # Optimizer
@@ -184,9 +211,9 @@ class Hyperparameters:
     use_compile = bool(int(os.environ.get("USE_COMPILE", "1")))
 
     # V34 additions
-    gptq_lite_enabled = bool(int(os.environ.get("GPTQ_LITE_ENABLED", "0")))
-    partial_rope_dims = int(os.environ.get("PARTIAL_ROPE_DIMS", "0"))
-    ln_scale_per_layer = bool(int(os.environ.get("LN_SCALE_PER_LAYER", "0")))
+    gptq_lite_enabled = bool(int(os.environ.get("GPTQ_LITE_ENABLED", "1")))
+    partial_rope_dims = int(os.environ.get("PARTIAL_ROPE_DIMS", "16"))
+    ln_scale_per_layer = bool(int(os.environ.get("LN_SCALE_PER_LAYER", "1")))
     parallel_muon_enabled = bool(int(os.environ.get("PARALLEL_MUON_ENABLED", "0")))
 
     # V34 Safe Bundle (final-push additions, plan: crispy-sauteeing-kernighan.md)
@@ -198,7 +225,7 @@ class Hyperparameters:
 
     # V37/V40 — Tensor-Train (TT/MPS) decomposition
     # V40 default: TT on both c_q AND attn.proj (extended scope vs V37 v1)
-    tt_enabled = bool(int(os.environ.get("TT_ENABLED", "0")))
+    tt_enabled = bool(int(os.environ.get("TT_ENABLED", "1")))
     tt_apply_to = tuple(
         s.strip() for s in os.environ.get("TT_APPLY_TO", "attn_qkv,attn_out").split(",") if s.strip()
     )
